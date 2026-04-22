@@ -401,6 +401,96 @@ pub const Binding = struct {
     span: Span,
 };
 
+// ====================== top-level declarations ======================
+
+/// A fully parsed `.zua` file — the sequence of top-level declarations.
+/// The parser stops only at EOF; errors during any single declaration are
+/// collected as diagnostics and an `invalid` Decl is emitted so the file
+/// shape stays intact.
+pub const File = struct {
+    span: Span,
+    decls: []Decl,
+};
+
+pub const Decl = struct {
+    span: Span,
+    /// `true` iff the declaration was prefixed with `export`. Whether that
+    /// has any visible effect (e.g. in the module system) is a later-stage
+    /// concern; the parser only records the user's intent.
+    exported: bool,
+    data: Data,
+
+    pub const Data = union(enum) {
+        fn_decl: FnDecl,
+        record_decl: RecordDecl,
+        enum_decl: EnumDecl,
+        type_alias: TypeAlias,
+        const_decl: ConstDecl,
+        invalid,
+    };
+};
+
+pub const GenericParam = struct {
+    name: []const u8,
+    span: Span,
+    // Future work: bounds / trait constraints would live here.
+};
+
+pub const FnDecl = struct {
+    name: []const u8,
+    name_span: Span,
+    generic_params: []GenericParam,
+    params: []Expr.Param,
+    return_type: ?*TypeExpr,
+    body: *Block,
+};
+
+pub const RecordDecl = struct {
+    name: []const u8,
+    name_span: Span,
+    generic_params: []GenericParam,
+    fields: []FieldDecl,
+};
+
+pub const EnumDecl = struct {
+    name: []const u8,
+    name_span: Span,
+    generic_params: []GenericParam,
+    variants: []Variant,
+};
+
+/// One variant of an `enum`. `Name` alone (empty `fields`) is a zero-
+/// payload variant; `Name { a: T }` carries record-style fields. No other
+/// shapes are supported in v1 (no tuple-style variants).
+pub const Variant = struct {
+    name: []const u8,
+    name_span: Span,
+    fields: []FieldDecl,
+};
+
+pub const FieldDecl = struct {
+    name: []const u8,
+    name_span: Span,
+    /// Records and variants require every field to carry a type
+    /// annotation — unlike function params and `var` bindings, there's
+    /// nothing to infer it from.
+    type_ann: *TypeExpr,
+};
+
+pub const TypeAlias = struct {
+    name: []const u8,
+    name_span: Span,
+    generic_params: []GenericParam,
+    target: *TypeExpr,
+};
+
+pub const ConstDecl = struct {
+    name: []const u8,
+    name_span: Span,
+    type_ann: ?*TypeExpr,
+    value: *Expr,
+};
+
 // ====================== pretty-printer ======================
 //
 // S-expression dump for use in tests. Not a pretty-printer for humans
@@ -610,6 +700,125 @@ pub fn formatPatternAlloc(p: *const Pattern, allocator: std.mem.Allocator) ![]u8
     var aw = std.Io.Writer.Allocating.init(allocator);
     errdefer aw.deinit();
     try formatPattern(p, &aw.writer);
+    return try aw.toOwnedSlice();
+}
+
+// ----- declaration pretty-printers -----
+
+pub fn formatDecl(d: *const Decl, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    if (d.exported) {
+        try writer.print("(export ", .{});
+        try formatDeclBody(&d.data, writer);
+        try writer.print(")", .{});
+    } else {
+        try formatDeclBody(&d.data, writer);
+    }
+}
+
+fn formatDeclBody(data: *const Decl.Data, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    switch (data.*) {
+        .fn_decl => |f| try formatFnDecl(&f, writer),
+        .record_decl => |r| try formatRecordDecl(&r, writer),
+        .enum_decl => |e| try formatEnumDecl(&e, writer),
+        .type_alias => |t| try formatTypeAlias(&t, writer),
+        .const_decl => |c| try formatConstDecl(&c, writer),
+        .invalid => try writer.print("<invalid-decl>", .{}),
+    }
+}
+
+fn formatGenerics(gs: []const GenericParam, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    if (gs.len == 0) return;
+    try writer.print(" (generics", .{});
+    for (gs) |g| try writer.print(" {s}", .{g.name});
+    try writer.print(")", .{});
+}
+
+fn formatFnDecl(f: *const FnDecl, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("(fn {s}", .{f.name});
+    try formatGenerics(f.generic_params, writer);
+    for (f.params) |p| {
+        try writer.print(" (", .{});
+        try writer.print("{s}", .{p.name});
+        if (p.type_ann) |ta| {
+            try writer.print(": ", .{});
+            try formatType(ta, writer);
+        }
+        try writer.print(")", .{});
+    }
+    if (f.return_type) |rt| {
+        try writer.print(" -> ", .{});
+        try formatType(rt, writer);
+    }
+    try writer.print(" ", .{});
+    try formatBlock(f.body, writer);
+    try writer.print(")", .{});
+}
+
+fn formatRecordDecl(r: *const RecordDecl, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("(record {s}", .{r.name});
+    try formatGenerics(r.generic_params, writer);
+    for (r.fields) |fd| {
+        try writer.print(" (field {s} ", .{fd.name});
+        try formatType(fd.type_ann, writer);
+        try writer.print(")", .{});
+    }
+    try writer.print(")", .{});
+}
+
+fn formatEnumDecl(e: *const EnumDecl, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("(enum {s}", .{e.name});
+    try formatGenerics(e.generic_params, writer);
+    for (e.variants) |v| {
+        try writer.print(" (variant {s}", .{v.name});
+        for (v.fields) |fd| {
+            try writer.print(" (field {s} ", .{fd.name});
+            try formatType(fd.type_ann, writer);
+            try writer.print(")", .{});
+        }
+        try writer.print(")", .{});
+    }
+    try writer.print(")", .{});
+}
+
+fn formatTypeAlias(t: *const TypeAlias, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("(typedef {s}", .{t.name});
+    try formatGenerics(t.generic_params, writer);
+    try writer.print(" ", .{});
+    try formatType(t.target, writer);
+    try writer.print(")", .{});
+}
+
+fn formatConstDecl(c: *const ConstDecl, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("(const {s}", .{c.name});
+    if (c.type_ann) |ta| {
+        try writer.print(" : ", .{});
+        try formatType(ta, writer);
+    }
+    try writer.print(" ", .{});
+    try formatExpr(c.value, writer);
+    try writer.print(")", .{});
+}
+
+pub fn formatFile(f: *const File, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("(file", .{});
+    for (f.decls) |*d| {
+        try writer.print(" ", .{});
+        try formatDecl(d, writer);
+    }
+    try writer.print(")", .{});
+}
+
+pub fn formatDeclAlloc(d: *const Decl, allocator: std.mem.Allocator) ![]u8 {
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    errdefer aw.deinit();
+    try formatDecl(d, &aw.writer);
+    return try aw.toOwnedSlice();
+}
+
+pub fn formatFileAlloc(f: *const File, allocator: std.mem.Allocator) ![]u8 {
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    errdefer aw.deinit();
+    try formatFile(f, &aw.writer);
     return try aw.toOwnedSlice();
 }
 

@@ -11,7 +11,7 @@
 //! Keywords: and, as, break, catch, const, continue, else, enum, export,
 //!   false, fn, for, from, go, if, impl, import, in, interface, match,
 //!   nil, not, or, partial, record, return, self, test, true, try, type,
-//!   while
+//!   var, while
 //!
 //! Literals:
 //!   int    := decimal | '0x' hex | '0b' binary | '0o' octal
@@ -126,6 +126,7 @@ pub const Token = struct {
         kw_true,
         kw_try,
         kw_type,
+        kw_var,
         kw_while,
 
         // Punctuation
@@ -240,6 +241,7 @@ fn keywordKind(word: []const u8) Token.Kind {
         .{ "true", Token.Kind.kw_true },
         .{ "try", Token.Kind.kw_try },
         .{ "type", Token.Kind.kw_type },
+        .{ "var", Token.Kind.kw_var },
         .{ "while", Token.Kind.kw_while },
     };
     inline for (entries) |entry| {
@@ -805,7 +807,11 @@ test "every keyword tokenises as its kind, not ident" {
         .{ "record", Token.Kind.kw_record },     .{ "return", Token.Kind.kw_return },
         .{ "self", Token.Kind.kw_self },         .{ "test", Token.Kind.kw_test },
         .{ "true", Token.Kind.kw_true },         .{ "try", Token.Kind.kw_try },
-        .{ "type", Token.Kind.kw_type },         .{ "while", Token.Kind.kw_while },
+        .{ "type", Token.Kind.kw_type },         .{ "var", Token.Kind.kw_var },
+        .{ "while", Token.Kind.kw_while },
+        // When adding a keyword, also append it to the `.Kind` enum above
+        // and to the `keywordKind` lookup table — this block only seeds the
+        // test, not the lexer itself.
     };
     inline for (cases) |c| {
         var tk = Tokenizer.init(c[0]);

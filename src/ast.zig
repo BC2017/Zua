@@ -1,0 +1,456 @@
+//! Zua AST — the shape every later compiler stage consumes.
+//!
+//! Nodes are arena-allocated tagged unions. Every node carries a `Span`
+//! (byte offsets into the original source) so diagnostics can point at the
+//! right place, and every leaf keeps the raw source lexeme rather than a
+//! decoded value. Decoding escape sequences, numeric values, and the like
+//! is left to the type checker / compiler — that way the parser is the
+//! single source of truth for "did this text parse" and doesn't also carry
+//! "did this number fit in an i64".
+//!
+//! The split between `Expr`, `TypeExpr`, and `Stmt` is intentional: they
+//! live in different syntactic positions with different precedence rules,
+//! and keeping them as separate types makes parser errors like "expected a
+//! type here" turn into type errors rather than tag mismatches.
+//!
+//! Recovery: the parser emits `.invalid` variants when it can't build a
+//! well-formed node but wants to keep parsing. Downstream stages should
+//! treat `.invalid` as "errors already reported for this subtree, don't
+//! pile on" rather than re-reporting.
+
+const std = @import("std");
+
+/// Byte range into the source buffer. u32 is enough for ~4 GB source files,
+/// which is comfortably larger than any single Zua program will ever be.
+pub const Span = struct {
+    start: u32,
+    end: u32,
+
+    pub fn merge(a: Span, b: Span) Span {
+        return .{ .start = @min(a.start, b.start), .end = @max(a.end, b.end) };
+    }
+};
+
+pub const UnaryOp = enum { neg, not };
+
+pub const BinaryOp = enum {
+    add,
+    sub,
+    mul,
+    div,
+    mod,
+    eq,
+    neq,
+    lt,
+    gt,
+    le,
+    ge,
+    logical_and,
+    logical_or,
+
+    pub fn symbol(op: BinaryOp) []const u8 {
+        return switch (op) {
+            .add => "+",
+            .sub => "-",
+            .mul => "*",
+            .div => "/",
+            .mod => "%",
+            .eq => "==",
+            .neq => "!=",
+            .lt => "<",
+            .gt => ">",
+            .le => "<=",
+            .ge => ">=",
+            .logical_and => "and",
+            .logical_or => "or",
+        };
+    }
+};
+
+pub const AssignOp = enum {
+    assign,
+    add_assign,
+    sub_assign,
+    mul_assign,
+    div_assign,
+    mod_assign,
+
+    pub fn symbol(op: AssignOp) []const u8 {
+        return switch (op) {
+            .assign => "=",
+            .add_assign => "+=",
+            .sub_assign => "-=",
+            .mul_assign => "*=",
+            .div_assign => "/=",
+            .mod_assign => "%=",
+        };
+    }
+};
+
+// ====================== expressions ======================
+
+pub const Expr = struct {
+    span: Span,
+    data: Data,
+
+    pub const Data = union(enum) {
+        // Literals carry raw lexeme slices (including quotes for strings and
+        // base prefixes for numbers). Decoding happens in a later pass.
+        int_literal: []const u8,
+        float_literal: []const u8,
+        string_literal: []const u8,
+        /// A string with one or more `${expr}` substitutions. Parts alternate
+        /// between raw text runs (may be empty) and embedded expressions.
+        string_interp: []StringPart,
+        bool_literal: bool,
+        nil_literal,
+
+        // References
+        ident: []const u8,
+        self_ref,
+
+        // Compound
+        unary: Unary,
+        binary: Binary,
+        call: Call,
+        method_call: MethodCall,
+        field: Field,
+        index: Index,
+        range: Range,
+        try_expr: *Expr,
+
+        // Collection literals
+        array_literal: []Expr,
+        map_literal: []MapEntry,
+
+        /// Parser synthesised this node to represent a subtree that failed
+        /// to parse. Diagnostics for the failure have already been emitted.
+        invalid,
+    };
+
+    pub const Unary = struct { op: UnaryOp, operand: *Expr };
+    pub const Binary = struct { op: BinaryOp, lhs: *Expr, rhs: *Expr };
+    pub const Call = struct { callee: *Expr, args: []Expr };
+    pub const MethodCall = struct { receiver: *Expr, name: []const u8, args: []Expr };
+    pub const Field = struct { receiver: *Expr, name: []const u8 };
+    pub const Index = struct { receiver: *Expr, index: *Expr };
+    pub const Range = struct { start: *Expr, end: *Expr, inclusive: bool };
+    pub const MapEntry = struct { key: *Expr, value: *Expr };
+};
+
+pub const StringPart = union(enum) {
+    /// Raw literal text between `${...}` substitutions. May be the empty
+    /// string when two substitutions touch (e.g., `"${a}${b}"`).
+    text: []const u8,
+    /// An embedded expression — the source's `${...}` contents.
+    expr: *Expr,
+};
+
+// ====================== types ======================
+
+pub const TypeExpr = struct {
+    span: Span,
+    data: Data,
+
+    pub const Data = union(enum) {
+        /// A named type with zero or more generic arguments:
+        /// `int`, `Point`, `Array<int>`, `Map<string, Array<int>>`.
+        named: Named,
+        /// `T?` — an optional. Parsed as a postfix suffix and stored as a
+        /// dedicated node so the type checker doesn't have to re-discover
+        /// it inside `named` each time.
+        optional: *TypeExpr,
+        /// `!T` — the error-as-value wrapper.
+        error_type: *TypeExpr,
+        /// `fn(T1, T2) -> R`.
+        function: Function,
+        /// `self`, valid only inside `impl` method signatures. The parser
+        /// accepts it anywhere and leaves the legality check to the type
+        /// stage — that way we can write tests for parse shape in isolation.
+        self_type,
+        invalid,
+    };
+
+    pub const Named = struct { name: []const u8, type_args: []TypeExpr };
+    pub const Function = struct { params: []TypeExpr, ret: *TypeExpr };
+};
+
+// ====================== statements ======================
+
+pub const Stmt = struct {
+    span: Span,
+    data: Data,
+
+    pub const Data = union(enum) {
+        /// A bare expression at statement position (e.g. a function call
+        /// whose return value we discard).
+        expr: *Expr,
+        /// `var x = e` / `const x = e`, optionally with `: T` annotation.
+        var_decl: VarDecl,
+        /// `target op= value` where `op=` covers `=`, `+=`, and friends.
+        assign: Assign,
+        /// `return` optionally followed by an expression.
+        return_stmt: ?*Expr,
+        break_stmt,
+        continue_stmt,
+        invalid,
+    };
+
+    pub const VarDecl = struct {
+        is_const: bool,
+        name: []const u8,
+        name_span: Span,
+        type_ann: ?*TypeExpr,
+        value: *Expr,
+    };
+
+    pub const Assign = struct {
+        op: AssignOp,
+        target: *Expr,
+        value: *Expr,
+    };
+};
+
+// ====================== pretty-printer ======================
+//
+// S-expression dump for use in tests. Not a pretty-printer for humans
+// (indentation would make tests too whitespace-sensitive); just a compact,
+// unambiguous shape we can compare strings against.
+
+pub fn formatExpr(expr: *const Expr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    switch (expr.data) {
+        .int_literal => |v| try writer.print("(int {s})", .{v}),
+        .float_literal => |v| try writer.print("(float {s})", .{v}),
+        .string_literal => |v| try writer.print("(str {s})", .{v}),
+        .string_interp => |parts| {
+            try writer.print("(interp", .{});
+            for (parts) |part| switch (part) {
+                .text => |t| try writer.print(" (text \"{s}\")", .{t}),
+                .expr => |e| {
+                    try writer.print(" ", .{});
+                    try formatExpr(e, writer);
+                },
+            };
+            try writer.print(")", .{});
+        },
+        .bool_literal => |b| try writer.print("{s}", .{if (b) "true" else "false"}),
+        .nil_literal => try writer.print("nil", .{}),
+        .ident => |n| try writer.print("(id {s})", .{n}),
+        .self_ref => try writer.print("self", .{}),
+        .unary => |u| {
+            const sym = switch (u.op) {
+                .neg => "-",
+                .not => "not",
+            };
+            try writer.print("({s} ", .{sym});
+            try formatExpr(u.operand, writer);
+            try writer.print(")", .{});
+        },
+        .binary => |b| {
+            try writer.print("({s} ", .{b.op.symbol()});
+            try formatExpr(b.lhs, writer);
+            try writer.print(" ", .{});
+            try formatExpr(b.rhs, writer);
+            try writer.print(")", .{});
+        },
+        .call => |c| {
+            try writer.print("(call ", .{});
+            try formatExpr(c.callee, writer);
+            for (c.args) |*a| {
+                try writer.print(" ", .{});
+                try formatExpr(a, writer);
+            }
+            try writer.print(")", .{});
+        },
+        .method_call => |m| {
+            try writer.print("(mcall ", .{});
+            try formatExpr(m.receiver, writer);
+            try writer.print(" {s}", .{m.name});
+            for (m.args) |*a| {
+                try writer.print(" ", .{});
+                try formatExpr(a, writer);
+            }
+            try writer.print(")", .{});
+        },
+        .field => |f| {
+            try writer.print("(. ", .{});
+            try formatExpr(f.receiver, writer);
+            try writer.print(" {s})", .{f.name});
+        },
+        .index => |i| {
+            try writer.print("([] ", .{});
+            try formatExpr(i.receiver, writer);
+            try writer.print(" ", .{});
+            try formatExpr(i.index, writer);
+            try writer.print(")", .{});
+        },
+        .range => |r| {
+            const op = if (r.inclusive) "..=" else "..";
+            try writer.print("({s} ", .{op});
+            try formatExpr(r.start, writer);
+            try writer.print(" ", .{});
+            try formatExpr(r.end, writer);
+            try writer.print(")", .{});
+        },
+        .try_expr => |inner| {
+            try writer.print("(try ", .{});
+            try formatExpr(inner, writer);
+            try writer.print(")", .{});
+        },
+        .array_literal => |elems| {
+            try writer.print("(array", .{});
+            for (elems) |*e| {
+                try writer.print(" ", .{});
+                try formatExpr(e, writer);
+            }
+            try writer.print(")", .{});
+        },
+        .map_literal => |entries| {
+            try writer.print("(map", .{});
+            for (entries) |e| {
+                try writer.print(" (", .{});
+                try formatExpr(e.key, writer);
+                try writer.print(" ", .{});
+                try formatExpr(e.value, writer);
+                try writer.print(")", .{});
+            }
+            try writer.print(")", .{});
+        },
+        .invalid => try writer.print("<invalid>", .{}),
+    }
+}
+
+pub fn formatType(ty: *const TypeExpr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    switch (ty.data) {
+        .named => |n| {
+            if (n.type_args.len == 0) {
+                try writer.print("{s}", .{n.name});
+            } else {
+                try writer.print("{s}<", .{n.name});
+                for (n.type_args, 0..) |*ta, i| {
+                    if (i != 0) try writer.print(", ", .{});
+                    try formatType(ta, writer);
+                }
+                try writer.print(">", .{});
+            }
+        },
+        .optional => |inner| {
+            try formatType(inner, writer);
+            try writer.print("?", .{});
+        },
+        .error_type => |inner| {
+            try writer.print("!", .{});
+            try formatType(inner, writer);
+        },
+        .function => |f| {
+            try writer.print("fn(", .{});
+            for (f.params, 0..) |*p, i| {
+                if (i != 0) try writer.print(", ", .{});
+                try formatType(p, writer);
+            }
+            try writer.print(") -> ", .{});
+            try formatType(f.ret, writer);
+        },
+        .self_type => try writer.print("self", .{}),
+        .invalid => try writer.print("<invalid>", .{}),
+    }
+}
+
+pub fn formatStmt(stmt: *const Stmt, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    switch (stmt.data) {
+        .expr => |e| {
+            try writer.print("(expr ", .{});
+            try formatExpr(e, writer);
+            try writer.print(")", .{});
+        },
+        .var_decl => |v| {
+            try writer.print("({s} {s}", .{ if (v.is_const) "const" else "var", v.name });
+            if (v.type_ann) |ta| {
+                try writer.print(" : ", .{});
+                try formatType(ta, writer);
+            }
+            try writer.print(" ", .{});
+            try formatExpr(v.value, writer);
+            try writer.print(")", .{});
+        },
+        .assign => |a| {
+            try writer.print("({s} ", .{a.op.symbol()});
+            try formatExpr(a.target, writer);
+            try writer.print(" ", .{});
+            try formatExpr(a.value, writer);
+            try writer.print(")", .{});
+        },
+        .return_stmt => |v| {
+            if (v) |e| {
+                try writer.print("(return ", .{});
+                try formatExpr(e, writer);
+                try writer.print(")", .{});
+            } else {
+                try writer.print("(return)", .{});
+            }
+        },
+        .break_stmt => try writer.print("(break)", .{}),
+        .continue_stmt => try writer.print("(continue)", .{}),
+        .invalid => try writer.print("<invalid>", .{}),
+    }
+}
+
+/// Convenience: format to an owned string. Caller frees with `allocator.free`.
+/// Uses `Allocating.init` + `errdefer deinit` so that an error mid-format
+/// (e.g. OOM) doesn't leak the intermediate buffer.
+pub fn formatExprAlloc(expr: *const Expr, allocator: std.mem.Allocator) ![]u8 {
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    errdefer aw.deinit();
+    try formatExpr(expr, &aw.writer);
+    return try aw.toOwnedSlice();
+}
+
+pub fn formatStmtAlloc(stmt: *const Stmt, allocator: std.mem.Allocator) ![]u8 {
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    errdefer aw.deinit();
+    try formatStmt(stmt, &aw.writer);
+    return try aw.toOwnedSlice();
+}
+
+pub fn formatTypeAlloc(ty: *const TypeExpr, allocator: std.mem.Allocator) ![]u8 {
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    errdefer aw.deinit();
+    try formatType(ty, &aw.writer);
+    return try aw.toOwnedSlice();
+}
+
+// ====================== tests ======================
+
+test "span merge" {
+    const a: Span = .{ .start = 3, .end = 10 };
+    const b: Span = .{ .start = 0, .end = 5 };
+    const m = Span.merge(a, b);
+    try std.testing.expectEqual(@as(u32, 0), m.start);
+    try std.testing.expectEqual(@as(u32, 10), m.end);
+}
+
+test "format simple int literal" {
+    const alloc = std.testing.allocator;
+    var e: Expr = .{ .span = .{ .start = 0, .end = 2 }, .data = .{ .int_literal = "42" } };
+    const s = try formatExprAlloc(&e, alloc);
+    defer alloc.free(s);
+    try std.testing.expectEqualStrings("(int 42)", s);
+}
+
+test "format nested binary" {
+    const alloc = std.testing.allocator;
+    var one: Expr = .{ .span = .{ .start = 0, .end = 1 }, .data = .{ .int_literal = "1" } };
+    var two: Expr = .{ .span = .{ .start = 0, .end = 1 }, .data = .{ .int_literal = "2" } };
+    var three: Expr = .{ .span = .{ .start = 0, .end = 1 }, .data = .{ .int_literal = "3" } };
+    var inner: Expr = .{
+        .span = .{ .start = 0, .end = 3 },
+        .data = .{ .binary = .{ .op = .mul, .lhs = &two, .rhs = &three } },
+    };
+    var outer: Expr = .{
+        .span = .{ .start = 0, .end = 5 },
+        .data = .{ .binary = .{ .op = .add, .lhs = &one, .rhs = &inner } },
+    };
+    const s = try formatExprAlloc(&outer, alloc);
+    defer alloc.free(s);
+    try std.testing.expectEqualStrings("(+ (int 1) (* (int 2) (int 3)))", s);
+}

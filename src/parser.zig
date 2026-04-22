@@ -263,6 +263,8 @@ pub const Parser = struct {
             .kw_if => return self.parseIf(),
             .kw_match => return self.parseMatch(true),
             .kw_partial => return self.parsePartialMatch(),
+            .kw_fn => return self.parseClosure(),
+            .kw_go => return self.parseGoLaunch(),
             else => {
                 try self.diagf(tok, "expected expression, got {s}", .{@tagName(tok.kind)});
                 return error.InvalidSyntax;
@@ -689,6 +691,72 @@ pub const Parser = struct {
                 return error.InvalidSyntax;
             },
         }
+    }
+
+    /// Anonymous function expression: `fn(x: int) -> int { x * 2 }`. The
+    /// return-type annotation is optional — when omitted, the function
+    /// declares `nil` as its return, matching how side-effectful bodies
+    /// are usually written. Parameter type annotations are also optional
+    /// (default `any`) for gradual-typing consistency.
+    fn parseClosure(self: *Parser) Error!*Expr {
+        const fn_tok = self.advance();
+        _ = try self.expect(.lparen, "expected '(' after 'fn' in closure");
+
+        var params: std.ArrayList(Expr.Param) = .empty;
+        if (self.peekKind() != .rparen) {
+            while (true) {
+                const name_tok = try self.expect(.ident, "expected parameter name in closure");
+                var type_ann: ?*TypeExpr = null;
+                if (self.peekKind() == .colon) {
+                    _ = self.advance();
+                    type_ann = try self.parseType();
+                }
+                try params.append(self.arena, .{
+                    .name = name_tok.lexeme(self.source),
+                    .name_span = spanOf(name_tok),
+                    .type_ann = type_ann,
+                });
+                if (self.peekKind() != .comma) break;
+                _ = self.advance();
+                if (self.peekKind() == .rparen) break; // trailing comma
+            }
+        }
+        _ = try self.expect(.rparen, "expected ')' to close closure parameters");
+
+        var return_type: ?*TypeExpr = null;
+        if (self.peekKind() == .arrow) {
+            _ = self.advance();
+            return_type = try self.parseType();
+        }
+
+        const body = try self.parseBlockDirect();
+        return self.makeExpr(
+            .{ .closure = .{
+                .params = params.items,
+                .return_type = return_type,
+                .body = body,
+            } },
+            Span.merge(spanOf(fn_tok), body.span),
+        );
+    }
+
+    /// `go <call>` — launch the inner call as a goroutine. We parse the
+    /// inner at unary precedence so `go f() + 1` groups as `(go f()) + 1`
+    /// (matching how `try`, unary minus, and `not` bind). The inner must
+    /// be a call or method-call shape; anything else is a parse
+    /// diagnostic but still produces a `go_launch` node so downstream
+    /// passes see the user's intent.
+    fn parseGoLaunch(self: *Parser) Error!*Expr {
+        const go_tok = self.advance();
+        const inner = try self.parseExprPrec(.unary);
+        switch (inner.data) {
+            .call, .method_call => {},
+            else => try self.diagf(go_tok, "'go' expects a function call, got {s}", .{@tagName(inner.data)}),
+        }
+        return self.makeExpr(
+            .{ .go_launch = inner },
+            Span.merge(spanOf(go_tok), inner.span),
+        );
     }
 
     fn parseConstructorPattern(self: *Parser, name_tok: Token, name: []const u8) Error!ast.Pattern {
@@ -2050,6 +2118,128 @@ test "constructor pattern missing `:` binding is just shorthand" {
 
 test "`partial` without `match` is a parse error" {
     try expectParseError("partial x");
+}
+
+// ----- closures -----
+
+test "closure with no params, no return type" {
+    try expectExpr("fn() { 42 }", "(fn (block => (int 42)))");
+}
+
+test "closure with typed param and return" {
+    try expectExpr(
+        "fn(x: int) -> int { x * 2 }",
+        "(fn (x: int) -> int (block => (* (id x) (int 2))))",
+    );
+}
+
+test "closure with untyped param defaults to any (parser leaves null)" {
+    // The type checker will fill in `any` for type-annotation-less params.
+    // At parse time we preserve the absence so diagnostics can say "x has
+    // no explicit type" if needed.
+    try expectExpr("fn(x) { x }", "(fn (x) (block => (id x)))");
+}
+
+test "closure with multiple typed params" {
+    try expectExpr(
+        "fn(x: int, y: int) -> int { x + y }",
+        "(fn (x: int) (y: int) -> int (block => (+ (id x) (id y))))",
+    );
+}
+
+test "closure mixing typed and untyped params" {
+    try expectExpr(
+        "fn(x, y: int) { x + y }",
+        "(fn (x) (y: int) (block => (+ (id x) (id y))))",
+    );
+}
+
+test "closure with trailing comma in params" {
+    try expectExpr(
+        "fn(x: int, y: int,) { x }",
+        "(fn (x: int) (y: int) (block => (id x)))",
+    );
+}
+
+test "closure as rvalue in var declaration" {
+    try expectStmt(
+        "var double = fn(x: int) -> int { x * 2 }",
+        "(var double (fn (x: int) -> int (block => (* (id x) (int 2)))))",
+    );
+}
+
+test "immediately invoked closure" {
+    // `fn(){...}` is the closure (parsePrefix hits kw_fn), then `()` is
+    // a postfix call. The outer expression is a call whose callee is a
+    // closure.
+    try expectExpr(
+        "fn() { 1 }()",
+        "(call (fn (block => (int 1))))",
+    );
+}
+
+test "closure with complex body" {
+    try expectExpr(
+        "fn(n: int) -> int { var acc = 0; for i in 0..n { acc += i }; acc }",
+        "(fn (n: int) -> int (block (var acc (int 0)) (for i (.. (int 0) (id n)) (block (+= (id acc) (id i)))) => (id acc)))",
+    );
+}
+
+// ----- go launches -----
+
+test "go launching a simple call" {
+    try expectExpr("go f()", "(go (call (id f)))");
+}
+
+test "go launching a method call" {
+    try expectExpr(
+        "go ch.send(42)",
+        "(go (mcall (id ch) send (int 42)))",
+    );
+}
+
+test "go launching an immediately invoked closure" {
+    try expectExpr(
+        "go fn() { foo() }()",
+        "(go (call (fn (block => (call (id foo))))))",
+    );
+}
+
+test "go as a statement in a block" {
+    // go is an expression; as a final expression-statement it is
+    // trailing-promoted. This matches how any other expression behaves
+    // at block tail.
+    try expectStmt(
+        "{ var x = 1; go f(x) }",
+        "(expr (block (var x (int 1)) => (go (call (id f) (id x)))))",
+    );
+}
+
+test "go has unary precedence, not whole-expression" {
+    // `go f() + 1` parses as `(go f()) + 1`, matching `try` / `-` / `not`.
+    // The `+ 1` part is nonsense on a goroutine handle, but that's a
+    // type-check problem, not a parse problem.
+    try expectExpr(
+        "go f() + 1",
+        "(+ (go (call (id f))) (int 1))",
+    );
+}
+
+test "go on a non-call shape emits a diagnostic" {
+    // Still parses — we produce a go_launch node so the diagnostic path
+    // is less disruptive — but one diagnostic is recorded.
+    try expectParseError("go x");
+    try expectParseError("go 42");
+}
+
+test "fn in type position still works (regression)" {
+    // Closure parsing added a kw_fn prefix at expression level; verify
+    // parseType's kw_fn branch is still reachable via the type-expression
+    // paths (var decl with annotation).
+    try expectStmt(
+        "var cb: fn(int) -> int = fn(x: int) -> int { x }",
+        "(var cb : fn(int) -> int (fn (x: int) -> int (block => (id x))))",
+    );
 }
 
 // ----- integration-ish parse of a representative program -----

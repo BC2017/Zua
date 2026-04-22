@@ -132,6 +132,17 @@ pub const Expr = struct {
         // Record construction: `Point { x: 1, y: 2 }`.
         record_literal: RecordLit,
 
+        /// Anonymous function expression: `fn(x: int) -> int { x * 2 }`.
+        /// Named functions are a Phase C top-level declaration — at
+        /// expression position, `fn` only ever introduces a closure.
+        closure: Closure,
+
+        /// `go <call>` — launch the inner call as a goroutine. Stored as
+        /// `*Expr` rather than a richer struct because the parser has
+        /// already verified the pointee's shape is a call or method_call;
+        /// there is no extra metadata to carry.
+        go_launch: *Expr,
+
         /// Parser synthesised this node to represent a subtree that failed
         /// to parse. Diagnostics for the failure have already been emitted.
         invalid,
@@ -198,6 +209,24 @@ pub const Expr = struct {
         name: []const u8,
         name_span: Span,
         value: ?*Expr,
+    };
+
+    pub const Closure = struct {
+        params: []Param,
+        /// Optional `-> T` return type. When absent the function is
+        /// declared to return `nil` — a common case for side-effectful
+        /// closures like goroutine bodies.
+        return_type: ?*TypeExpr,
+        body: *Block,
+    };
+
+    /// A closure / function parameter. Type annotations are optional: an
+    /// unannotated parameter takes `any`, matching the gradual-typing
+    /// rule for unannotated bindings elsewhere.
+    pub const Param = struct {
+        name: []const u8,
+        name_span: Span,
+        type_ann: ?*TypeExpr,
     };
 };
 
@@ -492,8 +521,34 @@ pub fn formatExpr(expr: *const Expr, writer: *std.Io.Writer) std.Io.Writer.Error
         .if_expr => |i| try formatIf(&i, writer),
         .match_expr => |m| try formatMatch(&m, writer),
         .record_literal => |r| try formatRecordLit(&r, writer),
+        .closure => |c| try formatClosure(&c, writer),
+        .go_launch => |inner| {
+            try writer.print("(go ", .{});
+            try formatExpr(inner, writer);
+            try writer.print(")", .{});
+        },
         .invalid => try writer.print("<invalid>", .{}),
     }
+}
+
+fn formatClosure(c: *const Expr.Closure, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("(fn", .{});
+    for (c.params) |p| {
+        try writer.print(" (", .{});
+        try writer.print("{s}", .{p.name});
+        if (p.type_ann) |ta| {
+            try writer.print(": ", .{});
+            try formatType(ta, writer);
+        }
+        try writer.print(")", .{});
+    }
+    if (c.return_type) |rt| {
+        try writer.print(" -> ", .{});
+        try formatType(rt, writer);
+    }
+    try writer.print(" ", .{});
+    try formatBlock(c.body, writer);
+    try writer.print(")", .{});
 }
 
 fn formatMatch(m: *const Expr.Match, writer: *std.Io.Writer) std.Io.Writer.Error!void {

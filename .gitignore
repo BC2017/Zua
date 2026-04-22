@@ -6,3 +6,6 @@ zig-cache/
 *.exe
 *.pdb
 *.ilk
+
+# Per-user editor / tool state, not part of the project
+.claude/

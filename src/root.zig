@@ -1,18 +1,21 @@
-//! By convention, root.zig is the root source file when making a package.
-const std = @import("std");
-const Io = std.Io;
+//! Root module for the Zua language implementation.
+//!
+//! Everything that the CLI (and eventually any embedder of Zua as a library)
+//! uses is re-exported from this file. Each compiler/runtime stage lives in
+//! its own source file and is surfaced here so that `zig build test` can
+//! reach every test block in the project through the module graph.
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.print("Run `zig build test` to run the tests.\n", .{});
-}
+pub const lexer = @import("lexer.zig");
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+// Surface every submodule's `test` blocks to `zig build test`. A bare
+// `pub const lexer = @import(...)` is *not* enough — Zig only compiles test
+// blocks out of files whose declarations are semantically referenced, and a
+// top-level re-export doesn't force analysis of the imported file's test
+// bodies. A test block that references the submodule does. Without this,
+// `zig build test` silently reports "All 0 tests passed".
+//
+// Every new `.zig` file under `src/` that carries its own `test` blocks
+// needs a `_ =` line here, or those tests are invisible to CI.
+test {
+    _ = lexer;
 }

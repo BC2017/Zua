@@ -8,6 +8,10 @@
 pub const lexer = @import("lexer.zig");
 pub const ast = @import("ast.zig");
 pub const parser = @import("parser.zig");
+pub const value = @import("value.zig");
+pub const bytecode = @import("bytecode.zig");
+pub const compiler = @import("compiler.zig");
+pub const vm = @import("vm.zig");
 
 // Surface every submodule's `test` blocks to `zig build test`. A bare
 // `pub const foo = @import(...)` is *not* enough — Zig only compiles test
@@ -22,4 +26,8 @@ test {
     _ = lexer;
     _ = ast;
     _ = parser;
+    _ = value;
+    _ = bytecode;
+    _ = compiler;
+    _ = vm;
 }

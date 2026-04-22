@@ -857,9 +857,11 @@ pub const Parser = struct {
             .kw_const => return self.parseTopConstDecl(exported),
             .kw_interface => return self.parseInterfaceDecl(exported),
             .kw_impl => return self.parseImplDecl(exported),
+            .kw_import => return self.parseImportDecl(exported),
+            .kw_test => return self.parseTestDecl(exported),
             else => {
                 const tok = self.peek();
-                try self.diagf(tok, "expected a top-level declaration (fn/record/enum/type/const/interface/impl), got {s}", .{@tagName(tok.kind)});
+                try self.diagf(tok, "expected a top-level declaration (fn/record/enum/type/const/interface/impl/import/test), got {s}", .{@tagName(tok.kind)});
                 return error.InvalidSyntax;
             },
         }
@@ -907,6 +909,8 @@ pub const Parser = struct {
                 .kw_const,
                 .kw_interface,
                 .kw_impl,
+                .kw_import,
+                .kw_test,
                 .eof,
                 => return,
                 else => _ = self.advance(),
@@ -1144,6 +1148,107 @@ pub const Parser = struct {
             .self_span = pl.self_span,
             .params = pl.params,
             .return_type = return_type,
+        };
+    }
+
+    /// `import "util.zua"`                                  -> .whole
+    /// `import { foo, bar as baz } from "util.zua"`         -> .named
+    /// `import * as u from "util.zua"`                      -> .namespace
+    ///
+    /// The third shape leaves the `*` as our `.star` token; that's
+    /// fine because `*` in declaration-start position is unambiguous.
+    fn parseImportDecl(self: *Parser, exported: bool) Error!ast.Decl {
+        const import_tok = self.advance();
+        const next_kind = self.peekKind();
+        switch (next_kind) {
+            .string_literal => {
+                const path_tok = self.advance();
+                return .{
+                    .span = Span.merge(spanOf(import_tok), spanOf(path_tok)),
+                    .exported = exported,
+                    .data = .{ .import_decl = .{
+                        .path = path_tok.lexeme(self.source),
+                        .path_span = spanOf(path_tok),
+                        .kind = .whole,
+                    } },
+                };
+            },
+            .lbrace => {
+                _ = self.advance();
+                var entries: std.ArrayList(ast.NamedImport) = .empty;
+                if (self.peekKind() != .rbrace) {
+                    while (true) {
+                        const name_tok = try self.expect(.ident, "expected imported name");
+                        var alias: ?ast.Binding = null;
+                        if (self.peekKind() == .kw_as) {
+                            _ = self.advance();
+                            const alias_tok = try self.expect(.ident, "expected identifier after 'as' in import");
+                            alias = .{
+                                .name = alias_tok.lexeme(self.source),
+                                .span = spanOf(alias_tok),
+                            };
+                        }
+                        try entries.append(self.arena, .{
+                            .name = name_tok.lexeme(self.source),
+                            .name_span = spanOf(name_tok),
+                            .alias = alias,
+                        });
+                        if (self.peekKind() != .comma) break;
+                        _ = self.advance();
+                        if (self.peekKind() == .rbrace) break; // trailing comma
+                    }
+                }
+                _ = try self.expect(.rbrace, "expected '}' to close imported name list");
+                _ = try self.expect(.kw_from, "expected 'from' after imported names");
+                const path_tok = try self.expect(.string_literal, "expected import path string");
+                return .{
+                    .span = Span.merge(spanOf(import_tok), spanOf(path_tok)),
+                    .exported = exported,
+                    .data = .{ .import_decl = .{
+                        .path = path_tok.lexeme(self.source),
+                        .path_span = spanOf(path_tok),
+                        .kind = .{ .named = entries.items },
+                    } },
+                };
+            },
+            .star => {
+                _ = self.advance();
+                _ = try self.expect(.kw_as, "expected 'as' after '*' in namespace import");
+                const alias_tok = try self.expect(.ident, "expected namespace alias after 'as'");
+                _ = try self.expect(.kw_from, "expected 'from' after namespace alias");
+                const path_tok = try self.expect(.string_literal, "expected import path string");
+                return .{
+                    .span = Span.merge(spanOf(import_tok), spanOf(path_tok)),
+                    .exported = exported,
+                    .data = .{ .import_decl = .{
+                        .path = path_tok.lexeme(self.source),
+                        .path_span = spanOf(path_tok),
+                        .kind = .{ .namespace = .{
+                            .name = alias_tok.lexeme(self.source),
+                            .span = spanOf(alias_tok),
+                        } },
+                    } },
+                };
+            },
+            else => {
+                try self.diagf(self.peek(), "expected '\"path\"', '{{', or '*' after 'import', got {s}", .{@tagName(next_kind)});
+                return error.InvalidSyntax;
+            },
+        }
+    }
+
+    fn parseTestDecl(self: *Parser, exported: bool) Error!ast.Decl {
+        const test_tok = self.advance();
+        const name_tok = try self.expect(.string_literal, "expected string literal after 'test'");
+        const body = try self.parseBlockDirect();
+        return .{
+            .span = Span.merge(spanOf(test_tok), body.span),
+            .exported = exported,
+            .data = .{ .test_decl = .{
+                .name = name_tok.lexeme(self.source),
+                .name_span = spanOf(name_tok),
+                .body = body,
+            } },
         };
     }
 
@@ -3111,6 +3216,150 @@ test "file with interface and matching impl" {
         src,
         "(file (interface Drawable (methodsig draw self)) (record Point (field x float) (field y float)) (impl Drawable for Point (method draw self (block => (mcall (id io) print (str \"point\"))))))",
     );
+}
+
+// ----- imports -----
+
+test "whole-module import" {
+    try expectDecl(
+        "import \"util.zua\"",
+        "(import \"util.zua\")",
+    );
+}
+
+test "stdlib import uses the std/... path convention" {
+    try expectDecl(
+        "import \"std/io\"",
+        "(import \"std/io\")",
+    );
+}
+
+test "named imports" {
+    try expectDecl(
+        "import { foo, bar, baz } from \"util.zua\"",
+        "(import named \"util.zua\" foo bar baz)",
+    );
+}
+
+test "named import with trailing comma" {
+    try expectDecl(
+        "import { foo, bar, } from \"util.zua\"",
+        "(import named \"util.zua\" foo bar)",
+    );
+}
+
+test "named import with `as` alias" {
+    try expectDecl(
+        "import { foo as bar } from \"util.zua\"",
+        "(import named \"util.zua\" (foo as bar))",
+    );
+}
+
+test "named import mixing plain and aliased" {
+    try expectDecl(
+        "import { foo, bar as baz, quux } from \"util.zua\"",
+        "(import named \"util.zua\" foo (bar as baz) quux)",
+    );
+}
+
+test "namespace import with alias" {
+    try expectDecl(
+        "import * as u from \"util.zua\"",
+        "(import ns \"util.zua\" as u)",
+    );
+}
+
+test "import without a valid shape is a parse error" {
+    // `import foo` without quotes — nothing legal after `import` would
+    // be a bare ident.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parser = try Parser.init("import foo", arena);
+    _ = parser.parseDecl() catch |err| switch (err) {
+        error.InvalidSyntax => {
+            try testing.expect(parser.diagnostics.items.len > 0);
+            return;
+        },
+        else => return err,
+    };
+    try testing.expect(parser.diagnostics.items.len > 0);
+}
+
+test "re-export pattern: export-prefixed import parses" {
+    // `export import { foo } from "bar.zua"` re-exports foo. The parser
+    // records it syntactically; the module resolver decides later
+    // whether export-on-import is semantically meaningful.
+    try expectDecl(
+        "export import { foo } from \"bar.zua\"",
+        "(export (import named \"bar.zua\" foo))",
+    );
+}
+
+// ----- test blocks -----
+
+test "empty test block" {
+    try expectDecl(
+        "test \"my first test\" { }",
+        "(test \"my first test\" (block))",
+    );
+}
+
+test "test block with content" {
+    try expectDecl(
+        "test \"addition\" { const result = add(2, 3); expect(result, 5) }",
+        "(test \"addition\" (block (const result (call (id add) (int 2) (int 3))) => (call (id expect) (id result) (int 5))))",
+    );
+}
+
+test "test block without a name is a parse error" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parser = try Parser.init("test { }", arena);
+    _ = parser.parseDecl() catch |err| switch (err) {
+        error.InvalidSyntax => {
+            try testing.expect(parser.diagnostics.items.len > 0);
+            return;
+        },
+        else => return err,
+    };
+    try testing.expect(parser.diagnostics.items.len > 0);
+}
+
+// ----- integration: a complete .zua module -----
+
+test "complete module: imports, record, impl, test" {
+    const src: [:0]const u8 =
+        \\import "std/io"
+        \\import { double } from "util.zua"
+        \\
+        \\record Point { x: float, y: float }
+        \\
+        \\impl Show for Point {
+        \\  fn show(self) -> string {
+        \\    "(${self.x}, ${self.y})"
+        \\  }
+        \\}
+        \\
+        \\fn main() {
+        \\  const p = Point { x: 1.0, y: 2.0 }
+        \\  io.print(p.show())
+        \\}
+        \\
+        \\test "point round trips through show" {
+        \\  const p = Point { x: 0.0, y: 0.0 }
+        \\  expect(p.show(), "(0.0, 0.0)")
+        \\}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parser = try Parser.init(src, arena);
+    const file = try parser.parseFile();
+
+    try testing.expectEqual(@as(usize, 0), parser.diagnostics.items.len);
+    try testing.expectEqual(@as(usize, 6), file.decls.len);
 }
 
 // ----- integration-ish parse of a representative program -----

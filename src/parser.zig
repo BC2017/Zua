@@ -31,6 +31,7 @@ const Expr = ast.Expr;
 const TypeExpr = ast.TypeExpr;
 const Stmt = ast.Stmt;
 const Span = ast.Span;
+const Binding = ast.Binding;
 
 pub const Diagnostic = struct {
     span: Span,
@@ -47,6 +48,16 @@ pub const Parser = struct {
     tokens: []const Token,
     index: usize,
     diagnostics: std.ArrayList(Diagnostic),
+    /// When true, the "ident followed by `{`" shape is NOT parsed as a
+    /// record literal — the `{` is left for a caller that expects a block
+    /// body. Set when parsing the condition of `if`/`while`/`for`, the
+    /// scrutinee of `match`, and the iterable of `for`, so
+    /// `if point { ... }` is always "if, cond=point, then-block=`{...}`"
+    /// rather than "if, cond=`point {...}`, then-block=???". Parens reset
+    /// the flag to `false` (save+restore) so that users who *do* want a
+    /// record literal in a condition can write `if (Point { x: 1 }) { ... }`.
+    /// This matches Rust's `no_struct_literal` lexer/parser context.
+    no_record_literal: bool,
 
     pub fn init(source: [:0]const u8, arena: std.mem.Allocator) !Parser {
         var list: std.ArrayList(Token) = .empty;
@@ -62,6 +73,7 @@ pub const Parser = struct {
             .tokens = list.items,
             .index = 0,
             .diagnostics = .empty,
+            .no_record_literal = false,
         };
     }
 
@@ -187,6 +199,16 @@ pub const Parser = struct {
 
     fn parseExprPrec(self: *Parser, min_prec: Prec) Error!*Expr {
         var left = try self.parsePrefix();
+        // Record literal postfix: `Name { field: val, ... }`. Fires only
+        // on bare-ident primaries, and only when we're not in the no-
+        // record-literal context (inside an if/while/for condition or a
+        // match scrutinee, where `{` belongs to the body).
+        if (!self.no_record_literal and
+            left.data == .ident and
+            self.peekKind() == .lbrace)
+        {
+            left = try self.parseRecordLiteral(left);
+        }
         while (true) {
             const tok = self.peek();
             const prec = infixPrec(tok.kind);
@@ -239,6 +261,8 @@ pub const Parser = struct {
             .kw_not => return self.parseUnary(.not),
             .kw_try => return self.parseTry(),
             .kw_if => return self.parseIf(),
+            .kw_match => return self.parseMatch(true),
+            .kw_partial => return self.parsePartialMatch(),
             else => {
                 try self.diagf(tok, "expected expression, got {s}", .{@tagName(tok.kind)});
                 return error.InvalidSyntax;
@@ -300,6 +324,16 @@ pub const Parser = struct {
 
     fn parseParenExpr(self: *Parser) Error!*Expr {
         _ = self.advance(); // consume (
+        // A parenthesised subexpression is a fresh context — in particular,
+        // the no-record-literal restriction from an enclosing condition
+        // doesn't apply here. This is Rust's escape hatch for writing
+        // `if (Point { x: 1 }) { ... }` in condition position: the outer
+        // context wants to save `{` for the then-block, but once we're
+        // inside parens the ambiguity doesn't matter.
+        const prev = self.no_record_literal;
+        self.no_record_literal = false;
+        defer self.no_record_literal = prev;
+
         const inner = try self.parseExpr();
         _ = try self.expect(.rparen, "expected ')' to close grouped expression");
         // Parens are a parsing construct only — they affect precedence but
@@ -451,7 +485,7 @@ pub const Parser = struct {
 
     fn parseIf(self: *Parser) Error!*Expr {
         const if_tok = self.advance();
-        const cond = try self.parseExpr();
+        const cond = try self.parseCondExpr();
         const then_block = try self.parseBlockDirect();
 
         var else_branch: ?Expr.ElseBranch = null;
@@ -481,6 +515,217 @@ pub const Parser = struct {
             } },
             Span.merge(spanOf(if_tok), end_span),
         );
+    }
+
+    /// Parse an expression in a position where a following `{` belongs
+    /// to a body, not to the expression itself (condition of if/while/for,
+    /// iterable of for, scrutinee of match). Record literals are disabled
+    /// for the duration; parens are a valid escape hatch.
+    fn parseCondExpr(self: *Parser) Error!*Expr {
+        const prev = self.no_record_literal;
+        self.no_record_literal = true;
+        defer self.no_record_literal = prev;
+        return self.parseExpr();
+    }
+
+    fn parseRecordLiteral(self: *Parser, name_expr: *Expr) Error!*Expr {
+        // `name_expr` is guaranteed to be an `.ident` — the caller checked.
+        const name = name_expr.data.ident;
+        const name_span = name_expr.span;
+
+        _ = self.advance(); // consume `{`
+
+        var fields: std.ArrayList(Expr.FieldInit) = .empty;
+        if (self.peekKind() != .rbrace) {
+            while (true) {
+                const field_tok = try self.expect(.ident, "expected field name in record literal");
+                const field_name = field_tok.lexeme(self.source);
+                var value: ?*Expr = null;
+                if (self.peekKind() == .colon) {
+                    _ = self.advance();
+                    value = try self.parseExpr();
+                }
+                // Shorthand (no `:`): the field's value is `ident(field_name)`
+                // at lookup time. We leave `value == null` in the AST so
+                // the type checker can decide how to resolve it.
+                try fields.append(self.arena, .{
+                    .name = field_name,
+                    .name_span = spanOf(field_tok),
+                    .value = value,
+                });
+                if (self.peekKind() != .comma) break;
+                _ = self.advance();
+                if (self.peekKind() == .rbrace) break; // trailing comma
+            }
+        }
+        const end_tok = try self.expect(.rbrace, "expected '}' to close record literal");
+        return self.makeExpr(
+            .{ .record_literal = .{
+                .name = name,
+                .name_span = name_span,
+                .fields = fields.items,
+            } },
+            Span.merge(name_span, spanOf(end_tok)),
+        );
+    }
+
+    /// `match scrutinee { Pattern => body, ... }`. The scrutinee is parsed
+    /// in no-record-literal mode so the subsequent `{` consistently opens
+    /// the arm list.
+    fn parseMatch(self: *Parser, exhaustive: bool) Error!*Expr {
+        const match_tok = self.advance(); // consume `match`
+        const scrutinee = try self.parseCondExpr();
+        _ = try self.expect(.lbrace, "expected '{' to open match arms");
+
+        var arms: std.ArrayList(ast.MatchArm) = .empty;
+        // Allow an implicit semi right after `{` (ASI from `... match x {\n`).
+        self.skipSemis();
+        while (self.peekKind() != .rbrace and self.peekKind() != .eof) {
+            const arm = self.parseMatchArm() catch |err| switch (err) {
+                error.InvalidSyntax => {
+                    self.syncToMatchArmBoundary();
+                    continue;
+                },
+                else => return err,
+            };
+            try arms.append(self.arena, arm);
+            // Arm separator: comma, implicit semi from ASI after the body,
+            // or the end of the match. Explicit semis are also tolerated.
+            switch (self.peekKind()) {
+                .comma => _ = self.advance(),
+                .semi => {},
+                .rbrace, .eof => {},
+                else => {
+                    const bad = self.peek();
+                    try self.diagf(bad, "expected ',' or '}}' between match arms, got {s}", .{@tagName(bad.kind)});
+                    self.syncToMatchArmBoundary();
+                },
+            }
+            self.skipSemis();
+        }
+        const end_tok = try self.expect(.rbrace, "expected '}' to close match");
+
+        return self.makeExpr(
+            .{ .match_expr = .{
+                .scrutinee = scrutinee,
+                .arms = arms.items,
+                .exhaustive = exhaustive,
+            } },
+            Span.merge(spanOf(match_tok), spanOf(end_tok)),
+        );
+    }
+
+    fn parsePartialMatch(self: *Parser) Error!*Expr {
+        _ = self.advance(); // consume `partial`
+        if (self.peekKind() != .kw_match) {
+            try self.diagf(self.peek(), "expected 'match' after 'partial', got {s}", .{@tagName(self.peekKind())});
+            return error.InvalidSyntax;
+        }
+        return self.parseMatch(false);
+    }
+
+    fn parseMatchArm(self: *Parser) Error!ast.MatchArm {
+        const pat = try self.parsePattern();
+        _ = try self.expect(.fat_arrow, "expected '=>' after match pattern");
+        const body = try self.parseExpr();
+        return .{ .pattern = pat, .body = body };
+    }
+
+    /// Recovery within match: advance past the current arm without
+    /// descending into its body — stop at the next `,` or the closing
+    /// `}` of the match expression itself.
+    fn syncToMatchArmBoundary(self: *Parser) void {
+        while (true) {
+            switch (self.peekKind()) {
+                .comma, .rbrace, .eof => return,
+                else => _ = self.advance(),
+            }
+        }
+    }
+
+    fn parsePattern(self: *Parser) Error!ast.Pattern {
+        const tok = self.peek();
+        switch (tok.kind) {
+            .int_literal => {
+                _ = self.advance();
+                return .{ .span = spanOf(tok), .data = .{ .int_pat = tok.lexeme(self.source) } };
+            },
+            .float_literal => {
+                _ = self.advance();
+                return .{ .span = spanOf(tok), .data = .{ .float_pat = tok.lexeme(self.source) } };
+            },
+            .string_literal => {
+                _ = self.advance();
+                return .{ .span = spanOf(tok), .data = .{ .string_pat = tok.lexeme(self.source) } };
+            },
+            .kw_true => {
+                _ = self.advance();
+                return .{ .span = spanOf(tok), .data = .{ .bool_pat = true } };
+            },
+            .kw_false => {
+                _ = self.advance();
+                return .{ .span = spanOf(tok), .data = .{ .bool_pat = false } };
+            },
+            .kw_nil => {
+                _ = self.advance();
+                return .{ .span = spanOf(tok), .data = .nil_pat };
+            },
+            .ident => {
+                _ = self.advance();
+                const name = tok.lexeme(self.source);
+                if (std.mem.eql(u8, name, "_")) {
+                    return .{ .span = spanOf(tok), .data = .wildcard };
+                }
+                if (self.peekKind() == .lbrace) {
+                    return self.parseConstructorPattern(tok, name);
+                }
+                return .{
+                    .span = spanOf(tok),
+                    .data = .{ .bind = .{ .name = name, .span = spanOf(tok) } },
+                };
+            },
+            else => {
+                try self.diagf(tok, "expected pattern, got {s}", .{@tagName(tok.kind)});
+                return error.InvalidSyntax;
+            },
+        }
+    }
+
+    fn parseConstructorPattern(self: *Parser, name_tok: Token, name: []const u8) Error!ast.Pattern {
+        _ = self.advance(); // consume `{`
+        var fields: std.ArrayList(ast.Pattern.PatternField) = .empty;
+        if (self.peekKind() != .rbrace) {
+            while (true) {
+                const field_tok = try self.expect(.ident, "expected field name in constructor pattern");
+                const field_name = field_tok.lexeme(self.source);
+                var binding: ?Binding = null;
+                if (self.peekKind() == .colon) {
+                    _ = self.advance();
+                    const bind_tok = try self.expect(.ident, "expected binding name after ':' in constructor pattern");
+                    binding = .{
+                        .name = bind_tok.lexeme(self.source),
+                        .span = spanOf(bind_tok),
+                    };
+                }
+                try fields.append(self.arena, .{
+                    .field_name = field_name,
+                    .field_name_span = spanOf(field_tok),
+                    .binding = binding,
+                });
+                if (self.peekKind() != .comma) break;
+                _ = self.advance();
+                if (self.peekKind() == .rbrace) break; // trailing comma
+            }
+        }
+        const end_tok = try self.expect(.rbrace, "expected '}' to close constructor pattern");
+        return .{
+            .span = Span.merge(spanOf(name_tok), spanOf(end_tok)),
+            .data = .{ .constructor = .{
+                .name = name,
+                .name_span = spanOf(name_tok),
+                .fields = fields.items,
+            } },
+        };
     }
 
     fn parseCatch(self: *Parser, left: *Expr) Error!*Expr {
@@ -514,7 +759,7 @@ pub const Parser = struct {
 
     fn parseWhile(self: *Parser) Error!Stmt {
         const while_tok = self.advance();
-        const cond = try self.parseExpr();
+        const cond = try self.parseCondExpr();
         const body = try self.parseBlockDirect();
         return .{
             .span = Span.merge(spanOf(while_tok), body.span),
@@ -542,7 +787,7 @@ pub const Parser = struct {
         }
 
         _ = try self.expect(.kw_in, "expected 'in' after for-loop binding");
-        const iterable = try self.parseExpr();
+        const iterable = try self.parseCondExpr();
         const body = try self.parseBlockDirect();
 
         return .{
@@ -1027,6 +1272,10 @@ fn expectStmt(source: [:0]const u8, expected: []const u8) !void {
 }
 
 fn expectParseError(source: [:0]const u8) !void {
+    // "Parse error" means the parser either bubbled `error.InvalidSyntax`
+    // OR recovered locally (inside a match arm, block, etc.) and recorded
+    // at least one diagnostic. Both count — what we care about is that
+    // the malformed source was flagged rather than silently accepted.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1039,8 +1288,7 @@ fn expectParseError(source: [:0]const u8) !void {
         },
         else => return err,
     };
-    // If we got here, parseExpr succeeded when we expected a failure.
-    try testing.expect(false);
+    try testing.expect(parser.diagnostics.items.len > 0);
 }
 
 // ----- primary expressions -----
@@ -1571,6 +1819,237 @@ test "for body with control flow" {
         "for i in 0..n { if i == 5 { break } else { continue } }",
         "(for i (.. (int 0) (id n)) (block => (if (== (id i) (int 5)) (block (break)) else (block (continue)))))",
     );
+}
+
+// ----- record literals -----
+
+fn expectPattern(source: [:0]const u8, expected: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var parser = try Parser.init(source, arena);
+    const p = try parser.parsePattern();
+    try testing.expectEqual(@as(usize, 0), parser.diagnostics.items.len);
+    try testing.expectEqual(Token.Kind.eof, parser.peekKind());
+    const rendered = try ast.formatPatternAlloc(&p, testing.allocator);
+    defer testing.allocator.free(rendered);
+    try testing.expectEqualStrings(expected, rendered);
+}
+
+test "empty record literal" {
+    try expectExpr("Point {}", "(rec Point)");
+}
+
+test "record literal with one field" {
+    try expectExpr("Point { x: 1 }", "(rec Point (f x (int 1)))");
+}
+
+test "record literal with multiple fields" {
+    try expectExpr(
+        "Point { x: 1, y: 2 }",
+        "(rec Point (f x (int 1)) (f y (int 2)))",
+    );
+}
+
+test "record literal with shorthand field" {
+    // `Point { x }` is sugar for `Point { x: x }` — the local variable `x`
+    // supplies the value. AST keeps shorthand distinct (value == null) so
+    // the type checker can resolve scope explicitly.
+    try expectExpr("Point { x }", "(rec Point (f x))");
+    try expectExpr("Point { x, y }", "(rec Point (f x) (f y))");
+}
+
+test "record literal mixing explicit and shorthand fields" {
+    try expectExpr(
+        "Point { x: 0, y }",
+        "(rec Point (f x (int 0)) (f y))",
+    );
+}
+
+test "record literal with trailing comma" {
+    try expectExpr(
+        "Point { x: 1, y: 2, }",
+        "(rec Point (f x (int 1)) (f y (int 2)))",
+    );
+}
+
+test "nested record literal" {
+    try expectExpr(
+        "Rect { origin: Point { x: 0, y: 0 }, size: 10 }",
+        "(rec Rect (f origin (rec Point (f x (int 0)) (f y (int 0)))) (f size (int 10)))",
+    );
+}
+
+test "record literal as rvalue" {
+    try expectStmt(
+        "var p = Point { x: 1, y: 2 }",
+        "(var p (rec Point (f x (int 1)) (f y (int 2))))",
+    );
+}
+
+// ----- record-literal suppression in condition position -----
+
+test "if condition is a bare ident, not a record literal" {
+    // Without suppression, this would try to parse `shape { ... }` as a
+    // record literal and then hit EOF looking for a then-block.
+    try expectExpr(
+        "if shape { 1 }",
+        "(if (id shape) (block => (int 1)))",
+    );
+}
+
+test "while condition is a bare ident" {
+    try expectStmt(
+        "while running { step() }",
+        "(while (id running) (block => (call (id step))))",
+    );
+}
+
+test "for iterable is a bare ident" {
+    try expectStmt(
+        "for x in items { foo(x) }",
+        "(for x (id items) (block => (call (id foo) (id x))))",
+    );
+}
+
+test "parens in condition re-enable record literals" {
+    // The explicit parens are Rust's escape hatch: inside `(...)` the
+    // no-record-literal restriction is lifted, so `Point { x: 1, y: 2 }`
+    // parses as a record literal and the outer `{` is the if body.
+    try expectExpr(
+        "if (Point { x: 1, y: 2 }) { 1 }",
+        "(if (rec Point (f x (int 1)) (f y (int 2))) (block => (int 1)))",
+    );
+}
+
+// ----- patterns -----
+
+test "literal patterns" {
+    try expectPattern("42", "(intpat 42)");
+    try expectPattern("3.14", "(floatpat 3.14)");
+    try expectPattern("\"hi\"", "(strpat \"hi\")");
+    try expectPattern("true", "truepat");
+    try expectPattern("false", "falsepat");
+    try expectPattern("nil", "nilpat");
+}
+
+test "binding and wildcard patterns" {
+    try expectPattern("x", "(bind x)");
+    try expectPattern("_", "_");
+}
+
+test "constructor pattern with shorthand fields" {
+    try expectPattern("Circle { radius }", "(ctor Circle (radius))");
+    try expectPattern("Rect { width, height }", "(ctor Rect (width) (height))");
+}
+
+test "constructor pattern with renamed bindings" {
+    try expectPattern(
+        "Circle { radius: r }",
+        "(ctor Circle (radius r))",
+    );
+    try expectPattern(
+        "Rect { width: w, height: h }",
+        "(ctor Rect (width w) (height h))",
+    );
+}
+
+test "constructor pattern with mixed shorthand and rename" {
+    try expectPattern(
+        "Rect { width, height: h }",
+        "(ctor Rect (width) (height h))",
+    );
+}
+
+test "empty-fields constructor pattern" {
+    // Explicit `{}` after the name is required for zero-field variants,
+    // so they can be distinguished from bare-ident bindings at parse time.
+    try expectPattern("NoArgs {}", "(ctor NoArgs)");
+}
+
+// ----- match -----
+
+test "match with a single arm" {
+    try expectExpr(
+        "match x { 1 => \"one\" }",
+        "(match (id x) (arm (intpat 1) (str \"one\")))",
+    );
+}
+
+test "match with multiple arms, trailing comma" {
+    try expectExpr(
+        "match x { 1 => \"one\", 2 => \"two\", _ => \"other\", }",
+        "(match (id x) (arm (intpat 1) (str \"one\")) (arm (intpat 2) (str \"two\")) (arm _ (str \"other\")))",
+    );
+}
+
+test "match arms across newlines (ASI does not confuse separator handling)" {
+    try expectExpr(
+        "match x {\n  1 => \"one\",\n  2 => \"two\"\n}",
+        "(match (id x) (arm (intpat 1) (str \"one\")) (arm (intpat 2) (str \"two\")))",
+    );
+}
+
+test "match with constructor patterns" {
+    try expectExpr(
+        "match shape { Circle { radius } => radius, Square { side: s } => s }",
+        "(match (id shape) (arm (ctor Circle (radius)) (id radius)) (arm (ctor Square (side s)) (id s)))",
+    );
+}
+
+test "match with block-bodied arms" {
+    try expectExpr(
+        "match x { 1 => { foo(); 42 }, _ => 0 }",
+        "(match (id x) (arm (intpat 1) (block (expr (call (id foo))) => (int 42))) (arm _ (int 0)))",
+    );
+}
+
+test "partial match sets exhaustive to false" {
+    try expectExpr(
+        "partial match x { 1 => \"one\" }",
+        "(partial-match (id x) (arm (intpat 1) (str \"one\")))",
+    );
+}
+
+test "match as rvalue" {
+    try expectStmt(
+        "var label = match n { 0 => \"zero\", _ => \"nonzero\" }",
+        "(var label (match (id n) (arm (intpat 0) (str \"zero\")) (arm _ (str \"nonzero\"))))",
+    );
+}
+
+test "match scrutinee of bare ident does not swallow arm braces" {
+    // `match shape { ... }` — scrutinee is a bare `shape`, not
+    // `shape { ... }` as a record literal.
+    try expectExpr(
+        "match shape { _ => 1 }",
+        "(match (id shape) (arm _ (int 1)))",
+    );
+}
+
+test "match with record literal in arm body (no-record flag is scoped to scrutinee)" {
+    // The no-record-literal restriction applies only to the scrutinee;
+    // arm bodies are normal expressions where record literals work.
+    try expectExpr(
+        "match x { _ => Point { x: 1, y: 2 } }",
+        "(match (id x) (arm _ (rec Point (f x (int 1)) (f y (int 2)))))",
+    );
+}
+
+// ----- error cases specific to match/patterns -----
+
+test "match arm missing `=>` is a parse error" {
+    try expectParseError("match x { 1 \"one\" }");
+}
+
+test "constructor pattern missing `:` binding is just shorthand" {
+    // Not an error — `Circle { radius }` is valid shorthand.
+    try expectPattern("Circle { radius }", "(ctor Circle (radius))");
+}
+
+test "`partial` without `match` is a parse error" {
+    try expectParseError("partial x");
 }
 
 // ----- integration-ish parse of a representative program -----

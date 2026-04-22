@@ -127,6 +127,10 @@ pub const Expr = struct {
         // Control flow as expressions (Rust-style)
         block: *Block,
         if_expr: If,
+        match_expr: Match,
+
+        // Record construction: `Point { x: 1, y: 2 }`.
+        record_literal: RecordLit,
 
         /// Parser synthesised this node to represent a subtree that failed
         /// to parse. Diagnostics for the failure have already been emitted.
@@ -166,6 +170,89 @@ pub const Expr = struct {
     pub const ElseBranch = union(enum) {
         block: *Block,
         if_expr: *Expr,
+    };
+
+    pub const Match = struct {
+        scrutinee: *Expr,
+        arms: []MatchArm,
+        /// `partial match ...` sets this to false. The parser doesn't check
+        /// whether the arms actually cover every case — that's the type
+        /// checker's job — but it records the user's intent.
+        exhaustive: bool,
+    };
+
+    /// Construction of a named record type: `Point { x: 1, y: 2 }`.
+    /// Generic record types (`Pair<int, string> { ... }`) are deferred —
+    /// v1 accepts only bare type names on the constructor.
+    pub const RecordLit = struct {
+        name: []const u8,
+        name_span: Span,
+        fields: []FieldInit,
+    };
+
+    /// One `name: value` (or bare-ident shorthand) inside a record literal.
+    /// When `value` is null, the field is shorthand: the current scope's
+    /// binding with the same name as the field supplies the value — i.e.
+    /// `Point { x, y }` is sugar for `Point { x: x, y: y }`.
+    pub const FieldInit = struct {
+        name: []const u8,
+        name_span: Span,
+        value: ?*Expr,
+    };
+};
+
+pub const MatchArm = struct {
+    pattern: Pattern,
+    body: *Expr,
+};
+
+/// Patterns only appear in match arm heads for now. Array / or- /
+/// range- / guard-patterns are deferred: these forms cover the types we
+/// have today (records, enums with record-style variants, primitives).
+pub const Pattern = struct {
+    span: Span,
+    data: Data,
+
+    pub const Data = union(enum) {
+        /// Literal patterns match a specific value; equality is the
+        /// semantic contract (decoding still happens in a later pass).
+        int_pat: []const u8,
+        float_pat: []const u8,
+        string_pat: []const u8,
+        bool_pat: bool,
+        nil_pat,
+
+        /// `_` — matches anything, binds nothing.
+        wildcard,
+
+        /// A bare identifier — binds the scrutinee to this name. Acts as
+        /// a catch-all. Note that whether a bare identifier refers to an
+        /// enum variant or creates a binding is a semantic question;
+        /// parsing always produces `.bind`, and the type checker decides.
+        bind: Binding,
+
+        /// `Name { field: binding, shorthand }` — matches a record (or
+        /// record-style enum variant) with the listed fields. Requires
+        /// explicit `Name { }` braces even for zero-field variants so
+        /// that we can reliably distinguish from `.bind`.
+        constructor: Constructor,
+
+        invalid,
+    };
+
+    pub const Constructor = struct {
+        name: []const u8,
+        name_span: Span,
+        fields: []PatternField,
+    };
+
+    pub const PatternField = struct {
+        field_name: []const u8,
+        field_name_span: Span,
+        /// Binding name for the matched field. When null, it's shorthand:
+        /// `{ radius }` means the field `radius` is bound to a local
+        /// `radius`, equivalent to `{ radius: radius }`.
+        binding: ?Binding,
     };
 };
 
@@ -403,8 +490,72 @@ pub fn formatExpr(expr: *const Expr, writer: *std.Io.Writer) std.Io.Writer.Error
         },
         .block => |b| try formatBlock(b, writer),
         .if_expr => |i| try formatIf(&i, writer),
+        .match_expr => |m| try formatMatch(&m, writer),
+        .record_literal => |r| try formatRecordLit(&r, writer),
         .invalid => try writer.print("<invalid>", .{}),
     }
+}
+
+fn formatMatch(m: *const Expr.Match, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const head = if (m.exhaustive) "match" else "partial-match";
+    try writer.print("({s} ", .{head});
+    try formatExpr(m.scrutinee, writer);
+    for (m.arms) |*arm| {
+        try writer.print(" (arm ", .{});
+        try formatPattern(&arm.pattern, writer);
+        try writer.print(" ", .{});
+        try formatExpr(arm.body, writer);
+        try writer.print(")", .{});
+    }
+    try writer.print(")", .{});
+}
+
+fn formatRecordLit(r: *const Expr.RecordLit, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("(rec {s}", .{r.name});
+    for (r.fields) |f| {
+        if (f.value) |v| {
+            try writer.print(" (f {s} ", .{f.name});
+            try formatExpr(v, writer);
+            try writer.print(")", .{});
+        } else {
+            // Shorthand — no value, field name implies the binding.
+            try writer.print(" (f {s})", .{f.name});
+        }
+    }
+    try writer.print(")", .{});
+}
+
+pub fn formatPattern(p: *const Pattern, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    switch (p.data) {
+        .int_pat => |v| try writer.print("(intpat {s})", .{v}),
+        .float_pat => |v| try writer.print("(floatpat {s})", .{v}),
+        .string_pat => |v| try writer.print("(strpat {s})", .{v}),
+        .bool_pat => |b| try writer.print("{s}pat", .{if (b) "true" else "false"}),
+        .nil_pat => try writer.print("nilpat", .{}),
+        .wildcard => try writer.print("_", .{}),
+        .bind => |b| try writer.print("(bind {s})", .{b.name}),
+        .constructor => |c| {
+            try writer.print("(ctor {s}", .{c.name});
+            for (c.fields) |f| {
+                if (f.binding) |b| {
+                    // Explicit rename: field `foo` bound to local `bar`.
+                    try writer.print(" ({s} {s})", .{ f.field_name, b.name });
+                } else {
+                    // Shorthand: field name is the binding name.
+                    try writer.print(" ({s})", .{f.field_name});
+                }
+            }
+            try writer.print(")", .{});
+        },
+        .invalid => try writer.print("<invalid-pat>", .{}),
+    }
+}
+
+pub fn formatPatternAlloc(p: *const Pattern, allocator: std.mem.Allocator) ![]u8 {
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    errdefer aw.deinit();
+    try formatPattern(p, &aw.writer);
+    return try aw.toOwnedSlice();
 }
 
 pub fn formatBlock(b: *const Block, writer: *std.Io.Writer) std.Io.Writer.Error!void {

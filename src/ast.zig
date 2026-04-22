@@ -428,6 +428,8 @@ pub const Decl = struct {
         const_decl: ConstDecl,
         interface_decl: InterfaceDecl,
         impl_decl: ImplDecl,
+        import_decl: Import,
+        test_decl: TestDecl,
         invalid,
     };
 };
@@ -537,6 +539,42 @@ pub const MethodDef = struct {
     self_span: ?Span,
     params: []Expr.Param,
     return_type: ?*TypeExpr,
+    body: *Block,
+};
+
+/// Three import shapes, distinguished by what follows `import`:
+///
+///   import "util.zua"                  -> .whole
+///   import { foo, bar } from "x.zua"   -> .named
+///   import * as u from "x.zua"         -> .namespace
+///
+/// The `path` always carries the raw source lexeme including quotes —
+/// decoding it happens when the module resolver reads the filesystem,
+/// consistent with how the parser leaves all string literals undecoded.
+pub const Import = struct {
+    path: []const u8,
+    path_span: Span,
+    kind: Kind,
+
+    pub const Kind = union(enum) {
+        whole,
+        named: []NamedImport,
+        namespace: Binding,
+    };
+};
+
+/// One entry in `import { ... } from "..."`. `alias` captures an
+/// optional `as` rename — `{ foo as bar }` binds the export `foo`
+/// locally as `bar`.
+pub const NamedImport = struct {
+    name: []const u8,
+    name_span: Span,
+    alias: ?Binding,
+};
+
+pub const TestDecl = struct {
+    name: []const u8,
+    name_span: Span,
     body: *Block,
 };
 
@@ -773,6 +811,8 @@ fn formatDeclBody(data: *const Decl.Data, writer: *std.Io.Writer) std.Io.Writer.
         .const_decl => |c| try formatConstDecl(&c, writer),
         .interface_decl => |i| try formatInterfaceDecl(&i, writer),
         .impl_decl => |i| try formatImplDecl(&i, writer),
+        .import_decl => |i| try formatImport(&i, writer),
+        .test_decl => |t| try formatTestDecl(&t, writer),
         .invalid => try writer.print("<invalid-decl>", .{}),
     }
 }
@@ -904,6 +944,30 @@ fn formatImplDecl(i: *const ImplDecl, writer: *std.Io.Writer) std.Io.Writer.Erro
         try formatBlock(m.body, writer);
         try writer.print(")", .{});
     }
+    try writer.print(")", .{});
+}
+
+fn formatImport(i: *const Import, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    switch (i.kind) {
+        .whole => try writer.print("(import {s})", .{i.path}),
+        .named => |entries| {
+            try writer.print("(import named {s}", .{i.path});
+            for (entries) |e| {
+                if (e.alias) |a| {
+                    try writer.print(" ({s} as {s})", .{ e.name, a.name });
+                } else {
+                    try writer.print(" {s}", .{e.name});
+                }
+            }
+            try writer.print(")", .{});
+        },
+        .namespace => |alias| try writer.print("(import ns {s} as {s})", .{ i.path, alias.name }),
+    }
+}
+
+fn formatTestDecl(t: *const TestDecl, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("(test {s} ", .{t.name});
+    try formatBlock(t.body, writer);
     try writer.print(")", .{});
 }
 

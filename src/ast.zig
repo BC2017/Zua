@@ -118,10 +118,15 @@ pub const Expr = struct {
         index: Index,
         range: Range,
         try_expr: *Expr,
+        catch_expr: Catch,
 
         // Collection literals
         array_literal: []Expr,
         map_literal: []MapEntry,
+
+        // Control flow as expressions (Rust-style)
+        block: *Block,
+        if_expr: If,
 
         /// Parser synthesised this node to represent a subtree that failed
         /// to parse. Diagnostics for the failure have already been emitted.
@@ -136,6 +141,42 @@ pub const Expr = struct {
     pub const Index = struct { receiver: *Expr, index: *Expr };
     pub const Range = struct { start: *Expr, end: *Expr, inclusive: bool };
     pub const MapEntry = struct { key: *Expr, value: *Expr };
+
+    /// `try_expr catch [|e|] handler`. `err_binding == null` means the
+    /// user wrote `a catch b` (no binding — the error value is discarded).
+    /// The handler is itself an expression (often a block) that runs when
+    /// `inner` evaluates to an error.
+    pub const Catch = struct {
+        inner: *Expr,
+        err_binding: ?[]const u8,
+        err_binding_span: ?Span,
+        handler: *Expr,
+    };
+
+    pub const If = struct {
+        cond: *Expr,
+        then_block: *Block,
+        else_branch: ?ElseBranch,
+    };
+
+    /// An `else` tail is either a final block or another `if` (for
+    /// `else if` chains). Representing it as a nested `*Expr` that must be
+    /// an `.if_expr` lets the chain stay a simple linked list in the AST
+    /// rather than a specialised array of else-ifs.
+    pub const ElseBranch = union(enum) {
+        block: *Block,
+        if_expr: *Expr,
+    };
+};
+
+/// A braced `{ stmt; stmt; trailing_expr? }`. Appears both as a standalone
+/// expression and as the body of `if` / `while` / `for`. When `trailing`
+/// is non-null, the block evaluates to that expression; otherwise it
+/// evaluates to `nil`.
+pub const Block = struct {
+    span: Span,
+    stmts: []Stmt,
+    trailing: ?*Expr,
 };
 
 pub const StringPart = union(enum) {
@@ -193,6 +234,13 @@ pub const Stmt = struct {
         return_stmt: ?*Expr,
         break_stmt,
         continue_stmt,
+        /// `while cond { ... }`. Kept as a statement (not an expression)
+        /// because its value would be unit/nil — no reason to spend a tag
+        /// slot on that.
+        while_stmt: While,
+        /// `for binding in iterable { ... }`. Statement for the same
+        /// reason as `while`.
+        for_stmt: For,
         invalid,
     };
 
@@ -209,6 +257,32 @@ pub const Stmt = struct {
         target: *Expr,
         value: *Expr,
     };
+
+    pub const While = struct {
+        cond: *Expr,
+        body: *Block,
+    };
+
+    pub const For = struct {
+        pattern: ForPattern,
+        iterable: *Expr,
+        body: *Block,
+    };
+};
+
+/// The binding(s) introduced by a `for` loop:
+///   `for x in arr`         -> .single("x")
+///   `for k, v in map`      -> .key_value(.{ "k", "v" })
+pub const ForPattern = union(enum) {
+    single: Binding,
+    key_value: KeyValue,
+
+    pub const KeyValue = struct { key: Binding, value: Binding };
+};
+
+pub const Binding = struct {
+    name: []const u8,
+    span: Span,
 };
 
 // ====================== pretty-printer ======================
@@ -316,8 +390,52 @@ pub fn formatExpr(expr: *const Expr, writer: *std.Io.Writer) std.Io.Writer.Error
             }
             try writer.print(")", .{});
         },
+        .catch_expr => |c| {
+            try writer.print("(catch ", .{});
+            try formatExpr(c.inner, writer);
+            if (c.err_binding) |name| {
+                try writer.print(" |{s}| ", .{name});
+            } else {
+                try writer.print(" ", .{});
+            }
+            try formatExpr(c.handler, writer);
+            try writer.print(")", .{});
+        },
+        .block => |b| try formatBlock(b, writer),
+        .if_expr => |i| try formatIf(&i, writer),
         .invalid => try writer.print("<invalid>", .{}),
     }
+}
+
+pub fn formatBlock(b: *const Block, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("(block", .{});
+    for (b.stmts) |*s| {
+        try writer.print(" ", .{});
+        try formatStmt(s, writer);
+    }
+    if (b.trailing) |t| {
+        try writer.print(" => ", .{});
+        try formatExpr(t, writer);
+    }
+    try writer.print(")", .{});
+}
+
+fn formatIf(i: *const Expr.If, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("(if ", .{});
+    try formatExpr(i.cond, writer);
+    try writer.print(" ", .{});
+    try formatBlock(i.then_block, writer);
+    if (i.else_branch) |eb| switch (eb) {
+        .block => |b| {
+            try writer.print(" else ", .{});
+            try formatBlock(b, writer);
+        },
+        .if_expr => |e| {
+            try writer.print(" else ", .{});
+            try formatExpr(e, writer);
+        },
+    };
+    try writer.print(")", .{});
 }
 
 pub fn formatType(ty: *const TypeExpr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -391,6 +509,25 @@ pub fn formatStmt(stmt: *const Stmt, writer: *std.Io.Writer) std.Io.Writer.Error
         },
         .break_stmt => try writer.print("(break)", .{}),
         .continue_stmt => try writer.print("(continue)", .{}),
+        .while_stmt => |w| {
+            try writer.print("(while ", .{});
+            try formatExpr(w.cond, writer);
+            try writer.print(" ", .{});
+            try formatBlock(w.body, writer);
+            try writer.print(")", .{});
+        },
+        .for_stmt => |f| {
+            try writer.print("(for ", .{});
+            switch (f.pattern) {
+                .single => |b| try writer.print("{s}", .{b.name}),
+                .key_value => |kv| try writer.print("(kv {s} {s})", .{ kv.key.name, kv.value.name }),
+            }
+            try writer.print(" ", .{});
+            try formatExpr(f.iterable, writer);
+            try writer.print(" ", .{});
+            try formatBlock(f.body, writer);
+            try writer.print(")", .{});
+        },
         .invalid => try writer.print("<invalid>", .{}),
     }
 }

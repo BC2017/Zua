@@ -163,9 +163,13 @@ pub const Parser = struct {
     /// Precedence of the given token *as an infix operator*. Tokens that
     /// cannot appear in infix position (or that we haven't assigned a
     /// precedence for) return `.none`, terminating the Pratt loop.
+    ///
+    /// `catch` sits at the same level as `or`, which matches Zig's
+    /// convention. That makes `a catch b or c` parse as `(a catch b) or c`
+    /// (left-to-right, same-precedence).
     fn infixPrec(kind: Token.Kind) Prec {
         return switch (kind) {
-            .kw_or => .or_,
+            .kw_or, .kw_catch => .or_,
             .kw_and => .and_,
             .eq, .neq => .equality,
             .lt, .gt, .le, .ge => .comparison,
@@ -230,10 +234,11 @@ pub const Parser = struct {
             },
             .lparen => return self.parseParenExpr(),
             .lbracket => return self.parseArrayLit(),
-            .lbrace => return self.parseMapLit(),
+            .lbrace => return self.parseBraceGroup(),
             .minus => return self.parseUnary(.neg),
             .kw_not => return self.parseUnary(.not),
             .kw_try => return self.parseTry(),
+            .kw_if => return self.parseIf(),
             else => {
                 try self.diagf(tok, "expected expression, got {s}", .{@tagName(tok.kind)});
                 return error.InvalidSyntax;
@@ -270,6 +275,7 @@ pub const Parser = struct {
             .dot => return self.parseDotOrMethod(left),
             .lbracket => return self.parseIndex(left),
             .lparen => return self.parseCall(left),
+            .kw_catch => return self.parseCatch(left),
             else => unreachable,
         }
     }
@@ -321,25 +327,273 @@ pub const Parser = struct {
         );
     }
 
-    fn parseMapLit(self: *Parser) Error!*Expr {
+    /// `{...}` is ambiguous — it could be a block, a map literal, or (once
+    /// we add them) a record literal. We disambiguate by behaviour, not by
+    /// syntactic markers, which keeps the user-facing syntax free of sigils
+    /// at the cost of a small speculative parse:
+    ///   - Empty `{}` is always a block (value = nil). Empty maps can be
+    ///     written as an explicit typed default or constructor later.
+    ///   - A statement-starting keyword (`var`/`const`/`return`/`break`/
+    ///     `continue`/`while`/`for`) commits to block mode immediately.
+    ///   - Otherwise parse one expression, then look at the next token:
+    ///     `:` means we were looking at a map key and go into map mode;
+    ///     anything else means we were looking at the first statement (or
+    ///     the trailing expression) of a block and go into block mode.
+    fn parseBraceGroup(self: *Parser) Error!*Expr {
         const start_tok = self.advance(); // consume {
-        var entries: std.ArrayList(Expr.MapEntry) = .empty;
-        if (self.peekKind() != .rbrace) {
-            while (true) {
-                const key = try self.parseExpr();
-                _ = try self.expect(.colon, "expected ':' between map key and value");
-                const val = try self.parseExpr();
-                try entries.append(self.arena, .{ .key = key, .value = val });
-                if (self.peekKind() != .comma) break;
+
+        if (self.peekKind() == .rbrace) {
+            const end_tok = self.advance();
+            return self.makeBlockExpr(&.{}, null, Span.merge(spanOf(start_tok), spanOf(end_tok)));
+        }
+
+        switch (self.peekKind()) {
+            .kw_var, .kw_const, .kw_return, .kw_break, .kw_continue,
+            .kw_while, .kw_for => return self.finishBlockExpr(start_tok, null),
+            else => {},
+        }
+
+        const first = try self.parseExpr();
+
+        if (self.peekKind() == .colon) {
+            // Map literal: `first` is the first key.
+            _ = self.advance();
+            const first_val = try self.parseExpr();
+            var entries: std.ArrayList(Expr.MapEntry) = .empty;
+            try entries.append(self.arena, .{ .key = first, .value = first_val });
+            if (self.peekKind() == .comma) {
                 _ = self.advance();
-                if (self.peekKind() == .rbrace) break; // trailing comma
+                while (self.peekKind() != .rbrace) {
+                    const key = try self.parseExpr();
+                    _ = try self.expect(.colon, "expected ':' between map key and value");
+                    const val = try self.parseExpr();
+                    try entries.append(self.arena, .{ .key = key, .value = val });
+                    if (self.peekKind() != .comma) break;
+                    _ = self.advance();
+                }
+            }
+            const end_tok = try self.expect(.rbrace, "expected '}' to close map literal");
+            return self.makeExpr(
+                .{ .map_literal = entries.items },
+                Span.merge(spanOf(start_tok), spanOf(end_tok)),
+            );
+        }
+
+        return self.finishBlockExpr(start_tok, first);
+    }
+
+    /// Complete parsing a block expression. `first_expr`, if non-null, is
+    /// an already-parsed leading expression from the speculative disambig-
+    /// uation in `parseBraceGroup` — it may be the first statement, the
+    /// trailing expression, or the LHS of an assignment statement, and
+    /// `finishBlock` figures out which based on what follows.
+    fn finishBlockExpr(self: *Parser, start_tok: Token, first_expr: ?*Expr) Error!*Expr {
+        const block = try self.finishBlock(start_tok, first_expr);
+        return self.makeExpr(.{ .block = block }, block.span);
+    }
+
+    /// Parse a block that we already know is a block (no map ambiguity) —
+    /// e.g. the body of an `if`/`while`/`for`. The caller hasn't consumed
+    /// the `{`.
+    fn parseBlockDirect(self: *Parser) Error!*ast.Block {
+        const start_tok = try self.expect(.lbrace, "expected '{' to open block");
+        return self.finishBlock(start_tok, null);
+    }
+
+    /// Shared block-building logic. Collects statements until `}` and
+    /// ergonomically promotes a trailing expression-statement into the
+    /// block's `trailing` slot.
+    ///
+    /// The promotion exists because with Go-style ASI, the user can't see
+    /// whether a final newline inserted a `;` or not. In Rust, the explicit
+    /// presence or absence of `;` after the last expression chooses between
+    /// "discard" and "return". We've already given up that signal, so we
+    /// commit to "the last expression is the block's value". `{ foo }` and
+    /// `{ foo; }` therefore mean the same thing; users who explicitly want
+    /// to discard should write `nil` or something similar at the tail.
+    fn finishBlock(self: *Parser, start_tok: Token, first_expr: ?*Expr) Error!*ast.Block {
+        var stmts: std.ArrayList(Stmt) = .empty;
+
+        if (first_expr) |fe| {
+            const s = try self.completeExprOrAssignStmt(fe);
+            try stmts.append(self.arena, s);
+            try self.consumeStmtSeparator();
+        }
+
+        while (self.peekKind() != .rbrace and self.peekKind() != .eof) {
+            const s = try self.parseStmt();
+            try stmts.append(self.arena, s);
+            try self.consumeStmtSeparator();
+        }
+
+        const end_tok = try self.expect(.rbrace, "expected '}' to close block");
+
+        var trailing: ?*Expr = null;
+        if (stmts.items.len > 0 and stmts.items[stmts.items.len - 1].data == .expr) {
+            trailing = stmts.items[stmts.items.len - 1].data.expr;
+            stmts.shrinkRetainingCapacity(stmts.items.len - 1);
+        }
+
+        const block = try self.arena.create(ast.Block);
+        block.* = .{
+            .span = Span.merge(spanOf(start_tok), spanOf(end_tok)),
+            .stmts = stmts.items,
+            .trailing = trailing,
+        };
+        return block;
+    }
+
+    fn makeBlockExpr(self: *Parser, stmts: []Stmt, trailing: ?*Expr, span: Span) !*Expr {
+        const block = try self.arena.create(ast.Block);
+        block.* = .{ .span = span, .stmts = stmts, .trailing = trailing };
+        return self.makeExpr(.{ .block = block }, span);
+    }
+
+    fn parseIf(self: *Parser) Error!*Expr {
+        const if_tok = self.advance();
+        const cond = try self.parseExpr();
+        const then_block = try self.parseBlockDirect();
+
+        var else_branch: ?Expr.ElseBranch = null;
+        var end_span = then_block.span;
+        if (self.peekKind() == .kw_else) {
+            _ = self.advance();
+            if (self.peekKind() == .kw_if) {
+                // `else if` chains as a nested `.if_expr` rather than an
+                // array of else-ifs. Keeps the AST a simple linked list
+                // and means any consumer (type check, codegen) walks
+                // chains without a special case.
+                const nested = try self.parseIf();
+                else_branch = .{ .if_expr = nested };
+                end_span = nested.span;
+            } else {
+                const eb = try self.parseBlockDirect();
+                else_branch = .{ .block = eb };
+                end_span = eb.span;
             }
         }
-        const end_tok = try self.expect(.rbrace, "expected '}' to close map literal");
+
         return self.makeExpr(
-            .{ .map_literal = entries.items },
-            Span.merge(spanOf(start_tok), spanOf(end_tok)),
+            .{ .if_expr = .{
+                .cond = cond,
+                .then_block = then_block,
+                .else_branch = else_branch,
+            } },
+            Span.merge(spanOf(if_tok), end_span),
         );
+    }
+
+    fn parseCatch(self: *Parser, left: *Expr) Error!*Expr {
+        _ = self.advance(); // consume `catch`
+
+        var binding: ?[]const u8 = null;
+        var binding_span: ?Span = null;
+        if (self.peekKind() == .pipe) {
+            _ = self.advance();
+            const name_tok = try self.expect(.ident, "expected identifier after '|' in catch binding");
+            binding = name_tok.lexeme(self.source);
+            binding_span = spanOf(name_tok);
+            _ = try self.expect(.pipe, "expected '|' to close catch binding");
+        }
+
+        // Parse the handler at strictly-greater precedence to keep catch
+        // left-associative at .or_ level. `a catch b catch c` parses as
+        // `(a catch b) catch c`, matching Zig's convention.
+        const handler = try self.parseExprPrec(@enumFromInt(@intFromEnum(Prec.or_) + 1));
+
+        return self.makeExpr(
+            .{ .catch_expr = .{
+                .inner = left,
+                .err_binding = binding,
+                .err_binding_span = binding_span,
+                .handler = handler,
+            } },
+            Span.merge(left.span, handler.span),
+        );
+    }
+
+    fn parseWhile(self: *Parser) Error!Stmt {
+        const while_tok = self.advance();
+        const cond = try self.parseExpr();
+        const body = try self.parseBlockDirect();
+        return .{
+            .span = Span.merge(spanOf(while_tok), body.span),
+            .data = .{ .while_stmt = .{ .cond = cond, .body = body } },
+        };
+    }
+
+    fn parseFor(self: *Parser) Error!Stmt {
+        const for_tok = self.advance();
+        const first_name = try self.expect(.ident, "expected binding name after 'for'");
+
+        var pattern: ast.ForPattern = undefined;
+        if (self.peekKind() == .comma) {
+            _ = self.advance();
+            const second_name = try self.expect(.ident, "expected second binding name after ',' (for key, value loops)");
+            pattern = .{ .key_value = .{
+                .key = .{ .name = first_name.lexeme(self.source), .span = spanOf(first_name) },
+                .value = .{ .name = second_name.lexeme(self.source), .span = spanOf(second_name) },
+            } };
+        } else {
+            pattern = .{ .single = .{
+                .name = first_name.lexeme(self.source),
+                .span = spanOf(first_name),
+            } };
+        }
+
+        _ = try self.expect(.kw_in, "expected 'in' after for-loop binding");
+        const iterable = try self.parseExpr();
+        const body = try self.parseBlockDirect();
+
+        return .{
+            .span = Span.merge(spanOf(for_tok), body.span),
+            .data = .{ .for_stmt = .{
+                .pattern = pattern,
+                .iterable = iterable,
+                .body = body,
+            } },
+        };
+    }
+
+    /// After an already-parsed expression, check for an assignment operator
+    /// and either complete an assignment statement or wrap the expression
+    /// as an expression statement. Mirrors the logic inside
+    /// `parseExprOrAssignStmt` but for a caller that has the LHS in hand.
+    fn completeExprOrAssignStmt(self: *Parser, lhs: *Expr) Error!Stmt {
+        const op_kind = self.peekKind();
+        const op: ?ast.AssignOp = switch (op_kind) {
+            .assign => .assign,
+            .plus_eq => .add_assign,
+            .minus_eq => .sub_assign,
+            .star_eq => .mul_assign,
+            .slash_eq => .div_assign,
+            .percent_eq => .mod_assign,
+            else => null,
+        };
+        if (op) |asgn_op| {
+            _ = self.advance();
+            const value = try self.parseExpr();
+            return .{
+                .span = Span.merge(lhs.span, value.span),
+                .data = .{ .assign = .{ .op = asgn_op, .target = lhs, .value = value } },
+            };
+        }
+        return .{ .span = lhs.span, .data = .{ .expr = lhs } };
+    }
+
+    /// Between two statements in a block we need a `;` (possibly an
+    /// implicit one from ASI). Missing separators are reported at the
+    /// offending token so the user knows where the statements ran together.
+    fn consumeStmtSeparator(self: *Parser) !void {
+        switch (self.peekKind()) {
+            .semi => self.skipSemis(),
+            .rbrace, .eof => {},
+            else => {
+                const bad = self.peek();
+                try self.diagf(bad, "expected ';' or newline between statements, got {s}", .{@tagName(bad.kind)});
+                self.syncToStmtBoundary();
+            },
+        }
     }
 
     fn parseCall(self: *Parser, callee: *Expr) Error!*Expr {
@@ -573,6 +827,8 @@ pub const Parser = struct {
                 _ = self.advance();
                 return .{ .span = spanOf(tok), .data = .continue_stmt };
             },
+            .kw_while => return self.parseWhile(),
+            .kw_for => return self.parseFor(),
             else => return self.parseExprOrAssignStmt(),
         }
     }
@@ -929,8 +1185,12 @@ test "array literal with trailing comma" {
     try expectExpr("[1, 2, 3,]", "(array (int 1) (int 2) (int 3))");
 }
 
-test "empty and populated map literals" {
-    try expectExpr("{}", "(map)");
+test "map literals need at least one key:value to disambiguate from block" {
+    // Bare `{}` is now an empty block — see `parseBraceGroup`. Maps are
+    // distinguished from blocks by the first expression being followed
+    // by a `:`. An "empty map" would look like every other empty block
+    // at the syntax level, so we resolve the tie toward block; users
+    // who need an empty map can use a typed constructor later.
     try expectExpr("{\"a\": 1}", "(map ((str \"a\") (int 1)))");
     try expectExpr(
         "{\"a\": 1, \"b\": 2}",
@@ -1122,6 +1382,195 @@ test "block recovers past a broken statement" {
     const third = try ast.formatStmtAlloc(&stmts[2], testing.allocator);
     defer testing.allocator.free(third);
     try testing.expectEqualStrings("(var z (int 3))", third);
+}
+
+// ----- block expressions -----
+
+test "empty braces are a block, not a map" {
+    try expectExpr("{}", "(block)");
+}
+
+test "block with only a trailing expression" {
+    try expectExpr("{ 42 }", "(block => (int 42))");
+    try expectExpr("{ x + 1 }", "(block => (+ (id x) (int 1)))");
+}
+
+test "block with statements and no trailing" {
+    try expectExpr(
+        "{ var x = 1; var y = 2 }",
+        // `var y = 2` is the last statement; not an expression, so no
+        // promotion to trailing.
+        "(block (var x (int 1)) (var y (int 2)))",
+    );
+}
+
+test "last expression-statement is promoted to trailing" {
+    try expectExpr(
+        "{ var x = 1; x }",
+        "(block (var x (int 1)) => (id x))",
+    );
+}
+
+test "block promotion works across ASI newlines" {
+    // With Go-style ASI, the newline before `}` inserts an implicit
+    // semicolon after `x`, but promotion lifts the final
+    // expression-statement back out to be the trailing expression. This
+    // is the ergonomic outcome — users don't have to see the hidden `;`.
+    try expectExpr(
+        "{\n  var y = 2\n  y\n}",
+        "(block (var y (int 2)) => (id y))",
+    );
+}
+
+test "block as rvalue in var declaration" {
+    try expectStmt(
+        "var x = { 1 + 2 }",
+        "(var x (block => (+ (int 1) (int 2))))",
+    );
+}
+
+// ----- if expressions -----
+
+test "if without else" {
+    try expectExpr(
+        "if x { 1 }",
+        "(if (id x) (block => (int 1)))",
+    );
+}
+
+test "if with else" {
+    try expectExpr(
+        "if x { 1 } else { 2 }",
+        "(if (id x) (block => (int 1)) else (block => (int 2)))",
+    );
+}
+
+test "if else-if chain flattens into nested if_expr" {
+    try expectExpr(
+        "if a { 1 } else if b { 2 } else { 3 }",
+        "(if (id a) (block => (int 1)) else (if (id b) (block => (int 2)) else (block => (int 3))))",
+    );
+}
+
+test "if as rvalue" {
+    try expectStmt(
+        "var y = if x > 0 { x } else { -x }",
+        "(var y (if (> (id x) (int 0)) (block => (id x)) else (block => (- (id x)))))",
+    );
+}
+
+test "complex condition in if" {
+    try expectExpr(
+        "if a and b or c { 1 }",
+        "(if (or (and (id a) (id b)) (id c)) (block => (int 1)))",
+    );
+}
+
+// ----- catch -----
+
+test "catch without binding is a default-value expression" {
+    try expectExpr(
+        "foo() catch 0",
+        "(catch (call (id foo)) (int 0))",
+    );
+}
+
+test "catch with |e| binding" {
+    try expectExpr(
+        "foo() catch |e| e",
+        "(catch (call (id foo)) |e| (id e))",
+    );
+}
+
+test "catch handler can be a block" {
+    try expectExpr(
+        "risky() catch |err| { err }",
+        "(catch (call (id risky)) |err| (block => (id err)))",
+    );
+}
+
+test "chained catch is left-associative" {
+    try expectExpr(
+        "a() catch b() catch 0",
+        "(catch (catch (call (id a)) (call (id b))) (int 0))",
+    );
+}
+
+test "catch has lower precedence than arithmetic" {
+    // `foo() catch 0 + 1` should parse as `(foo() catch (0 + 1))` because
+    // `+` binds tighter than `catch`.
+    try expectExpr(
+        "foo() catch 0 + 1",
+        "(catch (call (id foo)) (+ (int 0) (int 1)))",
+    );
+}
+
+// ----- while -----
+
+test "simple while" {
+    try expectStmt(
+        "while x > 0 { x -= 1 }",
+        "(while (> (id x) (int 0)) (block (-= (id x) (int 1))))",
+    );
+}
+
+test "while with empty body" {
+    try expectStmt("while cond {}", "(while (id cond) (block))");
+}
+
+// ----- for -----
+
+test "for over range" {
+    // Trailing promotion lifts the final expression-statement in every
+    // block — including for-loop bodies. The tail value is semantically
+    // ignored by a for body, but the parser's shape is uniform.
+    try expectStmt(
+        "for i in 0..10 { foo(i) }",
+        "(for i (.. (int 0) (int 10)) (block => (call (id foo) (id i))))",
+    );
+}
+
+test "for over array" {
+    // Compound assignment is not an expression-statement, so it is NOT
+    // promoted — the body stays a plain statement list with no trailing.
+    try expectStmt(
+        "for x in xs { total += x }",
+        "(for x (id xs) (block (+= (id total) (id x))))",
+    );
+}
+
+test "for over map with key, value" {
+    try expectStmt(
+        "for k, v in m { foo(k, v) }",
+        "(for (kv k v) (id m) (block => (call (id foo) (id k) (id v))))",
+    );
+}
+
+test "nested for loops" {
+    try expectStmt(
+        "for i in 0..n { for j in 0..n { use(i, j) } }",
+        "(for i (.. (int 0) (id n)) (block (for j (.. (int 0) (id n)) (block => (call (id use) (id i) (id j))))))",
+    );
+}
+
+// ----- interaction tests -----
+
+test "if inside a block, with trailing promotion" {
+    // The block's last statement is an if-expression with no else; it
+    // becomes the trailing. Note that if-without-else has value nil if
+    // the condition is false; the parser doesn't care about that, the
+    // type checker will.
+    try expectExpr(
+        "{ var x = 1; if x > 0 { x } else { 0 } }",
+        "(block (var x (int 1)) => (if (> (id x) (int 0)) (block => (id x)) else (block => (int 0))))",
+    );
+}
+
+test "for body with control flow" {
+    try expectStmt(
+        "for i in 0..n { if i == 5 { break } else { continue } }",
+        "(for i (.. (int 0) (id n)) (block => (if (== (id i) (int 5)) (block (break)) else (block (continue)))))",
+    );
 }
 
 // ----- integration-ish parse of a representative program -----

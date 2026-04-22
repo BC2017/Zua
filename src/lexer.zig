@@ -265,9 +265,20 @@ pub const Tokenizer = struct {
     /// to surface but cannot report in the middle of `skipTrivia` since that
     /// helper does not produce tokens itself.
     pending_invalid: ?Token.Loc,
+    /// Running count of unmatched `(` and `[`. Used to suppress
+    /// implicit-semicolon insertion inside grouped expressions so that a
+    /// multi-line argument list or array literal doesn't get a phantom
+    /// `; )` / `; ]` inserted into the middle. Braces are deliberately not
+    /// tracked here — `{...}` is used for blocks and for record/array
+    /// literals, and blocks genuinely want ASI to fire between statements.
+    /// Multi-line composite literals therefore need trailing commas (same
+    /// convention as Go).
+    paren_depth: u32,
     /// Context stack for string interpolation. Non-empty means we are
     /// currently lexing expression tokens inside a `${...}` — so `{` and `}`
     /// need to be tracked, and a `}` at depth zero resumes string-scanning.
+    /// Being inside a substitution also suppresses ASI, since the whole
+    /// substitution is one expression.
     interp_stack: [max_interp_depth]InterpCtx,
     interp_len: u8,
 
@@ -287,6 +298,7 @@ pub const Tokenizer = struct {
             .last_kind = .eof,
             .pending_semi = false,
             .pending_invalid = null,
+            .paren_depth = 0,
             .interp_stack = undefined,
             .interp_len = 0,
         };
@@ -315,7 +327,9 @@ pub const Tokenizer = struct {
             self.last_kind = .invalid;
             return Token{ .kind = .invalid, .loc = loc };
         }
-        if (saw_newline and self.last_kind.endsStatement()) {
+        if (saw_newline and self.last_kind.endsStatement() and
+            self.paren_depth == 0 and self.interp_len == 0)
+        {
             const t = Token{ .kind = .semi, .loc = .{ .start = self.index, .end = self.index } };
             self.last_kind = .semi;
             return t;
@@ -344,8 +358,14 @@ pub const Tokenizer = struct {
                 self.index += 1; // consume opening "
                 return self.scanStringSegment(start, .opening);
             },
-            '(' => return self.emitSingle(start, .lparen),
-            ')' => return self.emitSingle(start, .rparen),
+            '(' => {
+                self.paren_depth += 1;
+                return self.emitSingle(start, .lparen);
+            },
+            ')' => {
+                if (self.paren_depth > 0) self.paren_depth -= 1;
+                return self.emitSingle(start, .rparen);
+            },
             '{' => {
                 if (self.interp_len > 0) self.interp_stack[self.interp_len - 1].brace_depth += 1;
                 return self.emitSingle(start, .lbrace);
@@ -354,8 +374,14 @@ pub const Tokenizer = struct {
                 if (self.interp_len > 0) self.interp_stack[self.interp_len - 1].brace_depth -= 1;
                 return self.emitSingle(start, .rbrace);
             },
-            '[' => return self.emitSingle(start, .lbracket),
-            ']' => return self.emitSingle(start, .rbracket),
+            '[' => {
+                self.paren_depth += 1;
+                return self.emitSingle(start, .lbracket);
+            },
+            ']' => {
+                if (self.paren_depth > 0) self.paren_depth -= 1;
+                return self.emitSingle(start, .rbracket);
+            },
             ',' => return self.emitSingle(start, .comma),
             ';' => return self.emitSingle(start, .semi),
             ':' => return self.emitSingle(start, .colon),
@@ -934,6 +960,25 @@ test "ASI: newline after binary op does NOT insert semi (continuation)" {
 test "ASI: newline after comma or open paren does NOT insert semi" {
     try expectKinds("f(\n  a,\n  b\n)", &.{
         .ident, .lparen, .ident, .comma, .ident, .rparen,
+    });
+}
+
+test "ASI: multi-line bracket expression does NOT insert semi" {
+    try expectKinds("[\n  a,\n  b\n]", &.{
+        .lbracket, .ident, .comma, .ident, .rbracket,
+    });
+}
+
+test "ASI: newlines inside string interpolation do NOT inject semis" {
+    try expectKinds("\"${a +\n  b}\"", &.{
+        .string_start, .ident, .plus, .ident, .string_end,
+    });
+}
+
+test "ASI: but newlines inside a block DO inject semis (blocks are not paren-suppressed)" {
+    // `{}` around a block body still wants ASI between statements.
+    try expectKinds("{\n  a\n  b\n}", &.{
+        .lbrace, .ident, .semi, .ident, .semi, .rbrace,
     });
 }
 

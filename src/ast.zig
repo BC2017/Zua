@@ -426,6 +426,8 @@ pub const Decl = struct {
         enum_decl: EnumDecl,
         type_alias: TypeAlias,
         const_decl: ConstDecl,
+        interface_decl: InterfaceDecl,
+        impl_decl: ImplDecl,
         invalid,
     };
 };
@@ -489,6 +491,53 @@ pub const ConstDecl = struct {
     name_span: Span,
     type_ann: ?*TypeExpr,
     value: *Expr,
+};
+
+pub const InterfaceDecl = struct {
+    name: []const u8,
+    name_span: Span,
+    generic_params: []GenericParam,
+    methods: []MethodSig,
+};
+
+/// `impl [<generics>] InterfaceType for TargetType { methods }`. The
+/// `impl_generics` slot is distinct from either the interface's or the
+/// target's generic parameters — it's the `T` in
+/// `impl<T> Iterator<T> for Box<T>`. `interface_type` is stored as a
+/// full `TypeExpr` rather than a bare name so we can carry its generic
+/// args with it; the type checker will validate that its `.data` is
+/// `.named` (impl only makes sense for named interfaces).
+pub const ImplDecl = struct {
+    impl_generics: []GenericParam,
+    interface_type: *TypeExpr,
+    target_type: *TypeExpr,
+    methods: []MethodDef,
+};
+
+/// A method signature (no body) — the shape that appears in an
+/// `interface { ... }` body. `self_span` records the location of the
+/// `self` keyword when it was the first parameter; interface methods
+/// conventionally take `self`, but we don't force it at parse time so
+/// that type-unrelated functions-in-interfaces remain expressible.
+pub const MethodSig = struct {
+    name: []const u8,
+    name_span: Span,
+    generic_params: []GenericParam,
+    self_span: ?Span,
+    params: []Expr.Param,
+    return_type: ?*TypeExpr,
+};
+
+/// A method definition (with body) — the shape that appears in an
+/// `impl { ... }` body.
+pub const MethodDef = struct {
+    name: []const u8,
+    name_span: Span,
+    generic_params: []GenericParam,
+    self_span: ?Span,
+    params: []Expr.Param,
+    return_type: ?*TypeExpr,
+    body: *Block,
 };
 
 // ====================== pretty-printer ======================
@@ -722,6 +771,8 @@ fn formatDeclBody(data: *const Decl.Data, writer: *std.Io.Writer) std.Io.Writer.
         .enum_decl => |e| try formatEnumDecl(&e, writer),
         .type_alias => |t| try formatTypeAlias(&t, writer),
         .const_decl => |c| try formatConstDecl(&c, writer),
+        .interface_decl => |i| try formatInterfaceDecl(&i, writer),
+        .impl_decl => |i| try formatImplDecl(&i, writer),
         .invalid => try writer.print("<invalid-decl>", .{}),
     }
 }
@@ -796,6 +847,63 @@ fn formatConstDecl(c: *const ConstDecl, writer: *std.Io.Writer) std.Io.Writer.Er
     }
     try writer.print(" ", .{});
     try formatExpr(c.value, writer);
+    try writer.print(")", .{});
+}
+
+/// Common method-header rendering for both signatures and definitions.
+/// Emits `name [generics] [self] [params] [-> ret]` (omitting absent
+/// parts) so the caller only has to wrap it with the right outer form.
+fn formatMethodHeader(
+    name: []const u8,
+    generic_params: []const GenericParam,
+    self_span: ?Span,
+    params: []const Expr.Param,
+    return_type: ?*const TypeExpr,
+    writer: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    try writer.print("{s}", .{name});
+    try formatGenerics(generic_params, writer);
+    if (self_span != null) try writer.print(" self", .{});
+    for (params) |p| {
+        try writer.print(" (", .{});
+        try writer.print("{s}", .{p.name});
+        if (p.type_ann) |ta| {
+            try writer.print(": ", .{});
+            try formatType(ta, writer);
+        }
+        try writer.print(")", .{});
+    }
+    if (return_type) |rt| {
+        try writer.print(" -> ", .{});
+        try formatType(rt, writer);
+    }
+}
+
+fn formatInterfaceDecl(i: *const InterfaceDecl, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("(interface {s}", .{i.name});
+    try formatGenerics(i.generic_params, writer);
+    for (i.methods) |m| {
+        try writer.print(" (methodsig ", .{});
+        try formatMethodHeader(m.name, m.generic_params, m.self_span, m.params, m.return_type, writer);
+        try writer.print(")", .{});
+    }
+    try writer.print(")", .{});
+}
+
+fn formatImplDecl(i: *const ImplDecl, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("(impl", .{});
+    try formatGenerics(i.impl_generics, writer);
+    try writer.print(" ", .{});
+    try formatType(i.interface_type, writer);
+    try writer.print(" for ", .{});
+    try formatType(i.target_type, writer);
+    for (i.methods) |m| {
+        try writer.print(" (method ", .{});
+        try formatMethodHeader(m.name, m.generic_params, m.self_span, m.params, m.return_type, writer);
+        try writer.print(" ", .{});
+        try formatBlock(m.body, writer);
+        try writer.print(")", .{});
+    }
     try writer.print(")", .{});
 }
 

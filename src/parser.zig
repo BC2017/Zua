@@ -717,11 +717,36 @@ pub const Parser = struct {
         );
     }
 
-    /// Shared `( p1, p2: T, ... )` parameter list used by both closures
-    /// and top-level function declarations. Caller has not consumed the
-    /// opening `(`.
-    fn parseParamList(self: *Parser) Error![]Expr.Param {
+    /// Result of parsing a `(... )` parameter list that may optionally
+    /// open with `self` as its first parameter. `self_span` is non-null
+    /// iff `self` was present.
+    const ParamListResult = struct {
+        self_span: ?Span,
+        params: []Expr.Param,
+    };
+
+    /// Parse a `( [self,] p1, p2: T, ... )` parameter list. `self` is
+    /// accepted only as the first element, carries no type annotation
+    /// (the type is implied by the enclosing impl / interface), and is
+    /// not included in the returned `params` slice.
+    fn parseParamListWithSelf(self: *Parser) Error!ParamListResult {
         _ = try self.expect(.lparen, "expected '(' for parameter list");
+
+        var self_span: ?Span = null;
+        if (self.peekKind() == .kw_self) {
+            const self_tok = self.advance();
+            self_span = spanOf(self_tok);
+            switch (self.peekKind()) {
+                .comma => _ = self.advance(),
+                .rparen => {},
+                else => {
+                    const bad = self.peek();
+                    try self.diagf(bad, "expected ',' or ')' after 'self', got {s}", .{@tagName(bad.kind)});
+                    return error.InvalidSyntax;
+                },
+            }
+        }
+
         var params: std.ArrayList(Expr.Param) = .empty;
         if (self.peekKind() != .rparen) {
             while (true) {
@@ -742,7 +767,22 @@ pub const Parser = struct {
             }
         }
         _ = try self.expect(.rparen, "expected ')' to close parameter list");
-        return params.items;
+        return .{ .self_span = self_span, .params = params.items };
+    }
+
+    /// Non-method variant: closures and top-level `fn` declarations
+    /// cannot take `self`. If the user writes it anyway, record a
+    /// diagnostic and keep going with whatever the rest of the list
+    /// parsed to.
+    fn parseParamList(self: *Parser) Error![]Expr.Param {
+        const result = try self.parseParamListWithSelf();
+        if (result.self_span) |s| {
+            try self.diagnostics.append(self.arena, .{
+                .span = s,
+                .message = try self.arena.dupe(u8, "'self' is only valid as the first parameter of an interface method or impl method"),
+            });
+        }
+        return result.params;
     }
 
     /// `<T>` / `<T, U>` / `<>` (empty — rare but legal). Returns an empty
@@ -815,9 +855,11 @@ pub const Parser = struct {
             .kw_enum => return self.parseEnumDecl(exported),
             .kw_type => return self.parseTypeAlias(exported),
             .kw_const => return self.parseTopConstDecl(exported),
+            .kw_interface => return self.parseInterfaceDecl(exported),
+            .kw_impl => return self.parseImplDecl(exported),
             else => {
                 const tok = self.peek();
-                try self.diagf(tok, "expected a top-level declaration (fn/record/enum/type/const), got {s}", .{@tagName(tok.kind)});
+                try self.diagf(tok, "expected a top-level declaration (fn/record/enum/type/const/interface/impl), got {s}", .{@tagName(tok.kind)});
                 return error.InvalidSyntax;
             },
         }
@@ -863,6 +905,8 @@ pub const Parser = struct {
                 .kw_enum,
                 .kw_type,
                 .kw_const,
+                .kw_interface,
+                .kw_impl,
                 .eof,
                 => return,
                 else => _ = self.advance(),
@@ -997,6 +1041,131 @@ pub const Parser = struct {
                 .type_ann = type_ann,
                 .value = value,
             } },
+        };
+    }
+
+    fn parseInterfaceDecl(self: *Parser, exported: bool) Error!ast.Decl {
+        const interface_tok = self.advance();
+        const name_tok = try self.expect(.ident, "expected interface name");
+        const generic_params = try self.parseGenericParams();
+        _ = try self.expect(.lbrace, "expected '{' to open interface body");
+
+        var methods: std.ArrayList(ast.MethodSig) = .empty;
+        self.skipSemis();
+        while (self.peekKind() != .rbrace and self.peekKind() != .eof) {
+            const m = try self.parseMethodSig();
+            try methods.append(self.arena, m);
+            // Method-level separator tolerance: comma or ASI-inserted
+            // semicolon between methods is accepted, and so is an
+            // immediate `fn` (no separator at all — next method starts
+            // right away on the same line).
+            switch (self.peekKind()) {
+                .comma => _ = self.advance(),
+                .semi, .rbrace, .eof, .kw_fn => {},
+                else => {
+                    const bad = self.peek();
+                    try self.diagf(bad, "expected ',', 'fn', or '}}' between interface methods, got {s}", .{@tagName(bad.kind)});
+                    return error.InvalidSyntax;
+                },
+            }
+            self.skipSemis();
+        }
+        const end_tok = try self.expect(.rbrace, "expected '}' to close interface body");
+        return .{
+            .span = Span.merge(spanOf(interface_tok), spanOf(end_tok)),
+            .exported = exported,
+            .data = .{ .interface_decl = .{
+                .name = name_tok.lexeme(self.source),
+                .name_span = spanOf(name_tok),
+                .generic_params = generic_params,
+                .methods = methods.items,
+            } },
+        };
+    }
+
+    fn parseImplDecl(self: *Parser, exported: bool) Error!ast.Decl {
+        const impl_tok = self.advance();
+        // `impl` itself can be generic: `impl<T> Iterator<T> for Box<T>`.
+        // Generics on the target / interface are parsed as part of their
+        // respective types.
+        const impl_generics = try self.parseGenericParams();
+        const interface_type = try self.parseType();
+        _ = try self.expect(.kw_for, "expected 'for' after interface type in impl");
+        const target_type = try self.parseType();
+        _ = try self.expect(.lbrace, "expected '{' to open impl body");
+
+        var methods: std.ArrayList(ast.MethodDef) = .empty;
+        self.skipSemis();
+        while (self.peekKind() != .rbrace and self.peekKind() != .eof) {
+            const m = try self.parseMethodDef();
+            try methods.append(self.arena, m);
+            // Same tolerance as interface bodies. A closing `}` body
+            // already delimits the previous method, so a separator is
+            // usually redundant; accept comma / ASI-semi / immediate
+            // `fn` anyway for consistency.
+            switch (self.peekKind()) {
+                .comma => _ = self.advance(),
+                .semi, .rbrace, .eof, .kw_fn => {},
+                else => {
+                    const bad = self.peek();
+                    try self.diagf(bad, "expected ',', 'fn', or '}}' between impl methods, got {s}", .{@tagName(bad.kind)});
+                    return error.InvalidSyntax;
+                },
+            }
+            self.skipSemis();
+        }
+        const end_tok = try self.expect(.rbrace, "expected '}' to close impl body");
+        return .{
+            .span = Span.merge(spanOf(impl_tok), spanOf(end_tok)),
+            .exported = exported,
+            .data = .{ .impl_decl = .{
+                .impl_generics = impl_generics,
+                .interface_type = interface_type,
+                .target_type = target_type,
+                .methods = methods.items,
+            } },
+        };
+    }
+
+    fn parseMethodSig(self: *Parser) Error!ast.MethodSig {
+        _ = try self.expect(.kw_fn, "expected 'fn' to start interface method signature");
+        const name_tok = try self.expect(.ident, "expected method name");
+        const generic_params = try self.parseGenericParams();
+        const pl = try self.parseParamListWithSelf();
+        var return_type: ?*TypeExpr = null;
+        if (self.peekKind() == .arrow) {
+            _ = self.advance();
+            return_type = try self.parseType();
+        }
+        return .{
+            .name = name_tok.lexeme(self.source),
+            .name_span = spanOf(name_tok),
+            .generic_params = generic_params,
+            .self_span = pl.self_span,
+            .params = pl.params,
+            .return_type = return_type,
+        };
+    }
+
+    fn parseMethodDef(self: *Parser) Error!ast.MethodDef {
+        _ = try self.expect(.kw_fn, "expected 'fn' to start impl method");
+        const name_tok = try self.expect(.ident, "expected method name");
+        const generic_params = try self.parseGenericParams();
+        const pl = try self.parseParamListWithSelf();
+        var return_type: ?*TypeExpr = null;
+        if (self.peekKind() == .arrow) {
+            _ = self.advance();
+            return_type = try self.parseType();
+        }
+        const body = try self.parseBlockDirect();
+        return .{
+            .name = name_tok.lexeme(self.source),
+            .name_span = spanOf(name_tok),
+            .generic_params = generic_params,
+            .self_span = pl.self_span,
+            .params = pl.params,
+            .return_type = return_type,
+            .body = body,
         };
     }
 
@@ -2777,6 +2946,171 @@ test "file recovers past a broken declaration" {
     const second = try ast.formatDeclAlloc(&file.decls[1], testing.allocator);
     defer testing.allocator.free(second);
     try testing.expectEqualStrings("(const Y (int 2))", second);
+}
+
+// ----- interface declarations -----
+
+test "empty interface" {
+    try expectDecl("interface Empty { }", "(interface Empty)");
+}
+
+test "interface with one method" {
+    try expectDecl(
+        "interface Drawable { fn draw(self) }",
+        "(interface Drawable (methodsig draw self))",
+    );
+}
+
+test "interface with multiple methods and return types" {
+    try expectDecl(
+        "interface Shape { fn draw(self), fn area(self) -> float }",
+        "(interface Shape (methodsig draw self) (methodsig area self -> float))",
+    );
+}
+
+test "interface with ASI-separated methods" {
+    try expectDecl(
+        "interface Shape {\n  fn draw(self)\n  fn area(self) -> float\n}",
+        "(interface Shape (methodsig draw self) (methodsig area self -> float))",
+    );
+}
+
+test "interface with methods taking additional params" {
+    try expectDecl(
+        "interface Container { fn add(self, item: int), fn contains(self, item: int) -> bool }",
+        "(interface Container (methodsig add self (item: int)) (methodsig contains self (item: int) -> bool))",
+    );
+}
+
+test "generic interface" {
+    try expectDecl(
+        "interface Iterator<T> { fn next(self) -> T? }",
+        "(interface Iterator (generics T) (methodsig next self -> T?))",
+    );
+}
+
+test "interface method without self (unusual but legal)" {
+    // `self` is conventionally required on interface methods but we don't
+    // enforce it at the parse layer — the type checker can decide.
+    try expectDecl(
+        "interface Factory { fn make() -> int }",
+        "(interface Factory (methodsig make -> int))",
+    );
+}
+
+test "exported interface" {
+    try expectDecl(
+        "export interface Drawable { fn draw(self) }",
+        "(export (interface Drawable (methodsig draw self)))",
+    );
+}
+
+// ----- impl declarations -----
+
+test "impl for concrete type with one method" {
+    try expectDecl(
+        "impl Drawable for Point { fn draw(self) { } }",
+        "(impl Drawable for Point (method draw self (block)))",
+    );
+}
+
+test "impl method using self.field access" {
+    try expectDecl(
+        "impl Drawable for Point { fn draw(self) { io.print(self.x) } }",
+        "(impl Drawable for Point (method draw self (block => (mcall (id io) print (. self x)))))",
+    );
+}
+
+test "impl with multiple methods" {
+    try expectDecl(
+        "impl Shape for Circle { fn draw(self) { }, fn area(self) -> float { 3.14 * self.radius * self.radius } }",
+        "(impl Shape for Circle (method draw self (block)) (method area self -> float (block => (* (* (float 3.14) (. self radius)) (. self radius)))))",
+    );
+}
+
+test "impl with method taking extra params" {
+    try expectDecl(
+        "impl Container for Bag { fn add(self, item: int) { self.items.push(item) } }",
+        "(impl Container for Bag (method add self (item: int) (block => (mcall (. self items) push (id item)))))",
+    );
+}
+
+test "impl with generic interface argument" {
+    try expectDecl(
+        "impl Iterator<int> for Counter { fn next(self) -> int? { nil } }",
+        "(impl Iterator<int> for Counter (method next self -> int? (block => nil)))",
+    );
+}
+
+test "impl with its own generic parameters" {
+    // `impl<T> Iterator<T> for Box<T>` — the `<T>` between `impl` and the
+    // interface name is distinct from `Iterator<T>`'s own generic args
+    // and `Box<T>`'s own generic args.
+    try expectDecl(
+        "impl<T> Iterator<T> for Box<T> { fn next(self) -> T? { nil } }",
+        "(impl (generics T) Iterator<T> for Box<T> (method next self -> T? (block => nil)))",
+    );
+}
+
+test "impl for a complex target type" {
+    // Target doesn't have to be a bare name — array / optional / etc. are
+    // all valid type expressions.
+    try expectDecl(
+        "impl Show for Array<int> { fn show(self) -> string { \"array\" } }",
+        "(impl Show for Array<int> (method show self -> string (block => (str \"array\"))))",
+    );
+}
+
+test "impl without `for` is a parse error" {
+    // `impl Drawable { ... }` (missing `for Target`) — invalid.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parser = try Parser.init("impl Drawable { fn draw(self) { } }", arena);
+    _ = parser.parseDecl() catch |err| switch (err) {
+        error.InvalidSyntax => {
+            try testing.expect(parser.diagnostics.items.len > 0);
+            return;
+        },
+        else => return err,
+    };
+    try testing.expect(parser.diagnostics.items.len > 0);
+}
+
+// ----- self at top-level fn is a diagnostic -----
+
+test "self at top-level fn records a diagnostic" {
+    // Top-level fn decls don't take self; using it anyway is a parse
+    // diagnostic but doesn't bail the parser — we still produce a
+    // sensible FnDecl with the non-self params so recovery is graceful.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parser = try Parser.init("fn broken(self, x: int) { x }", arena);
+    _ = try parser.parseDecl();
+    try testing.expect(parser.diagnostics.items.len >= 1);
+}
+
+// ----- integration: interface + impl together -----
+
+test "file with interface and matching impl" {
+    const src: [:0]const u8 =
+        \\interface Drawable {
+        \\  fn draw(self)
+        \\}
+        \\
+        \\record Point { x: float, y: float }
+        \\
+        \\impl Drawable for Point {
+        \\  fn draw(self) {
+        \\    io.print("point")
+        \\  }
+        \\}
+    ;
+    try expectFile(
+        src,
+        "(file (interface Drawable (methodsig draw self)) (record Point (field x float) (field y float)) (impl Drawable for Point (method draw self (block => (mcall (id io) print (str \"point\"))))))",
+    );
 }
 
 // ----- integration-ish parse of a representative program -----

@@ -700,12 +700,32 @@ pub const Parser = struct {
     /// (default `any`) for gradual-typing consistency.
     fn parseClosure(self: *Parser) Error!*Expr {
         const fn_tok = self.advance();
-        _ = try self.expect(.lparen, "expected '(' after 'fn' in closure");
+        const params = try self.parseParamList();
+        var return_type: ?*TypeExpr = null;
+        if (self.peekKind() == .arrow) {
+            _ = self.advance();
+            return_type = try self.parseType();
+        }
+        const body = try self.parseBlockDirect();
+        return self.makeExpr(
+            .{ .closure = .{
+                .params = params,
+                .return_type = return_type,
+                .body = body,
+            } },
+            Span.merge(spanOf(fn_tok), body.span),
+        );
+    }
 
+    /// Shared `( p1, p2: T, ... )` parameter list used by both closures
+    /// and top-level function declarations. Caller has not consumed the
+    /// opening `(`.
+    fn parseParamList(self: *Parser) Error![]Expr.Param {
+        _ = try self.expect(.lparen, "expected '(' for parameter list");
         var params: std.ArrayList(Expr.Param) = .empty;
         if (self.peekKind() != .rparen) {
             while (true) {
-                const name_tok = try self.expect(.ident, "expected parameter name in closure");
+                const name_tok = try self.expect(.ident, "expected parameter name");
                 var type_ann: ?*TypeExpr = null;
                 if (self.peekKind() == .colon) {
                     _ = self.advance();
@@ -721,23 +741,263 @@ pub const Parser = struct {
                 if (self.peekKind() == .rparen) break; // trailing comma
             }
         }
-        _ = try self.expect(.rparen, "expected ')' to close closure parameters");
+        _ = try self.expect(.rparen, "expected ')' to close parameter list");
+        return params.items;
+    }
 
+    /// `<T>` / `<T, U>` / `<>` (empty — rare but legal). Returns an empty
+    /// slice if there's no `<` at all. Shared between every declaration
+    /// kind that supports generics (fn, record, enum, type alias).
+    fn parseGenericParams(self: *Parser) Error![]ast.GenericParam {
+        if (self.peekKind() != .lt) return &.{};
+        _ = self.advance();
+        var params: std.ArrayList(ast.GenericParam) = .empty;
+        if (self.peekKind() != .gt) {
+            while (true) {
+                const name_tok = try self.expect(.ident, "expected generic parameter name");
+                try params.append(self.arena, .{
+                    .name = name_tok.lexeme(self.source),
+                    .span = spanOf(name_tok),
+                });
+                if (self.peekKind() != .comma) break;
+                _ = self.advance();
+                if (self.peekKind() == .gt) break; // trailing comma
+            }
+        }
+        _ = try self.expect(.gt, "expected '>' to close generic parameter list");
+        return params.items;
+    }
+
+    /// Shared field-list parser for record bodies and record-shaped enum
+    /// variants. Accepts comma-separated fields; ASI-inserted `;` between
+    /// fields is also tolerated so that users writing each field on its
+    /// own line don't need to think about trailing commas.
+    fn parseFieldDeclList(self: *Parser) Error![]ast.FieldDecl {
+        var fields: std.ArrayList(ast.FieldDecl) = .empty;
+        self.skipSemis();
+        while (self.peekKind() != .rbrace and self.peekKind() != .eof) {
+            const name_tok = try self.expect(.ident, "expected field name");
+            _ = try self.expect(.colon, "expected ':' after field name");
+            const ty = try self.parseType();
+            try fields.append(self.arena, .{
+                .name = name_tok.lexeme(self.source),
+                .name_span = spanOf(name_tok),
+                .type_ann = ty,
+            });
+            switch (self.peekKind()) {
+                .comma => _ = self.advance(),
+                .semi, .rbrace, .eof => {},
+                else => {
+                    const bad = self.peek();
+                    try self.diagf(bad, "expected ',' or '}}' between fields, got {s}", .{@tagName(bad.kind)});
+                    return error.InvalidSyntax;
+                },
+            }
+            self.skipSemis();
+        }
+        return fields.items;
+    }
+
+    // ======================= top-level declarations =======================
+
+    /// Parse a single top-level declaration, optionally prefixed with
+    /// `export`. Bubbles `error.InvalidSyntax` on a mid-decl failure; the
+    /// file-level caller (`parseFile`) catches it and recovers.
+    pub fn parseDecl(self: *Parser) Error!ast.Decl {
+        var exported = false;
+        if (self.peekKind() == .kw_export) {
+            _ = self.advance();
+            exported = true;
+        }
+        switch (self.peekKind()) {
+            .kw_fn => return self.parseFnDecl(exported),
+            .kw_record => return self.parseRecordDecl(exported),
+            .kw_enum => return self.parseEnumDecl(exported),
+            .kw_type => return self.parseTypeAlias(exported),
+            .kw_const => return self.parseTopConstDecl(exported),
+            else => {
+                const tok = self.peek();
+                try self.diagf(tok, "expected a top-level declaration (fn/record/enum/type/const), got {s}", .{@tagName(tok.kind)});
+                return error.InvalidSyntax;
+            },
+        }
+    }
+
+    /// Parse an entire `.zua` source file into a `File`. Runs until EOF,
+    /// collecting one `Decl` per top-level form. A failure in any single
+    /// declaration is recorded as a diagnostic and the parser syncs to
+    /// the next declaration boundary so a file with N broken decls
+    /// produces (roughly) N diagnostics instead of one.
+    pub fn parseFile(self: *Parser) !ast.File {
+        var decls: std.ArrayList(ast.Decl) = .empty;
+        self.skipSemis();
+        const first_tok_span = spanOf(self.peek());
+        while (self.peekKind() != .eof) {
+            const decl = self.parseDecl() catch |err| switch (err) {
+                error.InvalidSyntax => {
+                    self.syncToDeclBoundary();
+                    continue;
+                },
+                else => return err,
+            };
+            try decls.append(self.arena, decl);
+            self.skipSemis();
+        }
+        const end_span = spanOf(self.peek());
+        return .{
+            .span = Span.merge(first_tok_span, end_span),
+            .decls = decls.items,
+        };
+    }
+
+    /// Recovery within a file: skip forward until we reach a token that
+    /// plausibly starts a new declaration. Intentionally narrow — we don't
+    /// want to eat through a well-formed enum body just because its
+    /// predecessor was broken.
+    fn syncToDeclBoundary(self: *Parser) void {
+        while (true) {
+            switch (self.peekKind()) {
+                .kw_export,
+                .kw_fn,
+                .kw_record,
+                .kw_enum,
+                .kw_type,
+                .kw_const,
+                .eof,
+                => return,
+                else => _ = self.advance(),
+            }
+        }
+    }
+
+    fn parseFnDecl(self: *Parser, exported: bool) Error!ast.Decl {
+        const fn_tok = self.advance();
+        const name_tok = try self.expect(.ident, "expected function name");
+        const generic_params = try self.parseGenericParams();
+        const params = try self.parseParamList();
         var return_type: ?*TypeExpr = null;
         if (self.peekKind() == .arrow) {
             _ = self.advance();
             return_type = try self.parseType();
         }
-
         const body = try self.parseBlockDirect();
-        return self.makeExpr(
-            .{ .closure = .{
-                .params = params.items,
+        return .{
+            .span = Span.merge(spanOf(fn_tok), body.span),
+            .exported = exported,
+            .data = .{ .fn_decl = .{
+                .name = name_tok.lexeme(self.source),
+                .name_span = spanOf(name_tok),
+                .generic_params = generic_params,
+                .params = params,
                 .return_type = return_type,
                 .body = body,
             } },
-            Span.merge(spanOf(fn_tok), body.span),
-        );
+        };
+    }
+
+    fn parseRecordDecl(self: *Parser, exported: bool) Error!ast.Decl {
+        const record_tok = self.advance();
+        const name_tok = try self.expect(.ident, "expected record name");
+        const generic_params = try self.parseGenericParams();
+        _ = try self.expect(.lbrace, "expected '{' to open record body");
+        const fields = try self.parseFieldDeclList();
+        const end_tok = try self.expect(.rbrace, "expected '}' to close record body");
+        return .{
+            .span = Span.merge(spanOf(record_tok), spanOf(end_tok)),
+            .exported = exported,
+            .data = .{ .record_decl = .{
+                .name = name_tok.lexeme(self.source),
+                .name_span = spanOf(name_tok),
+                .generic_params = generic_params,
+                .fields = fields,
+            } },
+        };
+    }
+
+    fn parseEnumDecl(self: *Parser, exported: bool) Error!ast.Decl {
+        const enum_tok = self.advance();
+        const name_tok = try self.expect(.ident, "expected enum name");
+        const generic_params = try self.parseGenericParams();
+        _ = try self.expect(.lbrace, "expected '{' to open enum body");
+
+        var variants: std.ArrayList(ast.Variant) = .empty;
+        self.skipSemis();
+        while (self.peekKind() != .rbrace and self.peekKind() != .eof) {
+            const v_name_tok = try self.expect(.ident, "expected variant name");
+            var fields: []ast.FieldDecl = &.{};
+            if (self.peekKind() == .lbrace) {
+                _ = self.advance();
+                fields = try self.parseFieldDeclList();
+                _ = try self.expect(.rbrace, "expected '}' to close variant fields");
+            }
+            try variants.append(self.arena, .{
+                .name = v_name_tok.lexeme(self.source),
+                .name_span = spanOf(v_name_tok),
+                .fields = fields,
+            });
+            switch (self.peekKind()) {
+                .comma => _ = self.advance(),
+                .semi, .rbrace, .eof => {},
+                else => {
+                    const bad = self.peek();
+                    try self.diagf(bad, "expected ',' or '}}' between variants, got {s}", .{@tagName(bad.kind)});
+                    return error.InvalidSyntax;
+                },
+            }
+            self.skipSemis();
+        }
+        const end_tok = try self.expect(.rbrace, "expected '}' to close enum");
+
+        return .{
+            .span = Span.merge(spanOf(enum_tok), spanOf(end_tok)),
+            .exported = exported,
+            .data = .{ .enum_decl = .{
+                .name = name_tok.lexeme(self.source),
+                .name_span = spanOf(name_tok),
+                .generic_params = generic_params,
+                .variants = variants.items,
+            } },
+        };
+    }
+
+    fn parseTypeAlias(self: *Parser, exported: bool) Error!ast.Decl {
+        const type_tok = self.advance();
+        const name_tok = try self.expect(.ident, "expected type alias name");
+        const generic_params = try self.parseGenericParams();
+        _ = try self.expect(.assign, "expected '=' in type alias");
+        const target = try self.parseType();
+        return .{
+            .span = Span.merge(spanOf(type_tok), target.span),
+            .exported = exported,
+            .data = .{ .type_alias = .{
+                .name = name_tok.lexeme(self.source),
+                .name_span = spanOf(name_tok),
+                .generic_params = generic_params,
+                .target = target,
+            } },
+        };
+    }
+
+    fn parseTopConstDecl(self: *Parser, exported: bool) Error!ast.Decl {
+        const const_tok = self.advance();
+        const name_tok = try self.expect(.ident, "expected identifier after 'const'");
+        var type_ann: ?*TypeExpr = null;
+        if (self.peekKind() == .colon) {
+            _ = self.advance();
+            type_ann = try self.parseType();
+        }
+        _ = try self.expect(.assign, "expected '=' in const declaration");
+        const value = try self.parseExpr();
+        return .{
+            .span = Span.merge(spanOf(const_tok), value.span),
+            .exported = exported,
+            .data = .{ .const_decl = .{
+                .name = name_tok.lexeme(self.source),
+                .name_span = spanOf(name_tok),
+                .type_ann = type_ann,
+                .value = value,
+            } },
+        };
     }
 
     /// `go <call>` — launch the inner call as a goroutine. We parse the
@@ -2240,6 +2500,283 @@ test "fn in type position still works (regression)" {
         "var cb: fn(int) -> int = fn(x: int) -> int { x }",
         "(var cb : fn(int) -> int (fn (x: int) -> int (block => (id x))))",
     );
+}
+
+// ----- top-level declarations -----
+
+fn expectDecl(source: [:0]const u8, expected: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var parser = try Parser.init(source, arena);
+    const decl = try parser.parseDecl();
+    try testing.expectEqual(@as(usize, 0), parser.diagnostics.items.len);
+    parser.skipSemis();
+    try testing.expectEqual(Token.Kind.eof, parser.peekKind());
+    const rendered = try ast.formatDeclAlloc(&decl, testing.allocator);
+    defer testing.allocator.free(rendered);
+    try testing.expectEqualStrings(expected, rendered);
+}
+
+fn expectFile(source: [:0]const u8, expected: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var parser = try Parser.init(source, arena);
+    const file = try parser.parseFile();
+    try testing.expectEqual(@as(usize, 0), parser.diagnostics.items.len);
+    const rendered = try ast.formatFileAlloc(&file, testing.allocator);
+    defer testing.allocator.free(rendered);
+    try testing.expectEqualStrings(expected, rendered);
+}
+
+// ----- fn declarations -----
+
+test "fn decl with no params, no return" {
+    // Can't name this `go` — that's a reserved goroutine-launch keyword.
+    // Nice reminder that the lexer's keyword set *is* the set of names
+    // users can't use for their own bindings.
+    try expectDecl(
+        "fn tick() { }",
+        "(fn tick (block))",
+    );
+}
+
+test "fn decl with typed params and return" {
+    try expectDecl(
+        "fn add(x: int, y: int) -> int { x + y }",
+        "(fn add (x: int) (y: int) -> int (block => (+ (id x) (id y))))",
+    );
+}
+
+test "fn decl with untyped params" {
+    try expectDecl(
+        "fn log(msg) { io.print(msg) }",
+        "(fn log (msg) (block => (mcall (id io) print (id msg))))",
+    );
+}
+
+test "generic fn decl" {
+    try expectDecl(
+        "fn map<T, U>(arr: Array<T>, f: fn(T) -> U) -> Array<U> { arr }",
+        "(fn map (generics T U) (arr: Array<T>) (f: fn(T) -> U) -> Array<U> (block => (id arr)))",
+    );
+}
+
+test "exported fn decl" {
+    try expectDecl(
+        "export fn helper() { }",
+        "(export (fn helper (block)))",
+    );
+}
+
+// ----- record declarations -----
+
+test "empty record" {
+    try expectDecl("record Unit { }", "(record Unit)");
+}
+
+test "record with fields" {
+    try expectDecl(
+        "record Point { x: float, y: float }",
+        "(record Point (field x float) (field y float))",
+    );
+}
+
+test "record with fields across newlines (ASI semis between fields)" {
+    // No trailing comma — ASI-inserted `;` between fields is tolerated
+    // because users writing one field per line shouldn't have to think
+    // about the punctuation.
+    try expectDecl(
+        "record Point {\n  x: float\n  y: float\n}",
+        "(record Point (field x float) (field y float))",
+    );
+}
+
+test "record with trailing comma" {
+    try expectDecl(
+        "record Point { x: float, y: float, }",
+        "(record Point (field x float) (field y float))",
+    );
+}
+
+test "record with complex field types" {
+    try expectDecl(
+        "record Grid { cells: Array<Array<int>>, size: int? }",
+        "(record Grid (field cells Array<Array<int>>) (field size int?))",
+    );
+}
+
+test "generic record" {
+    try expectDecl(
+        "record Pair<A, B> { first: A, second: B }",
+        "(record Pair (generics A B) (field first A) (field second B))",
+    );
+}
+
+test "exported record" {
+    try expectDecl(
+        "export record Point { x: float, y: float }",
+        "(export (record Point (field x float) (field y float)))",
+    );
+}
+
+// ----- enum declarations -----
+
+test "enum with field-carrying variants" {
+    try expectDecl(
+        "enum Shape { Circle { radius: float }, Square { side: float } }",
+        "(enum Shape (variant Circle (field radius float)) (variant Square (field side float)))",
+    );
+}
+
+test "enum with zero-field variant (bare name, no braces)" {
+    // Zero-field variants in an enum *declaration* may skip `{ }` — no
+    // ambiguity here, unlike pattern position where `Name` means a
+    // binding and `Name {}` means a zero-field constructor.
+    try expectDecl(
+        "enum State { Idle, Running, Stopped }",
+        "(enum State (variant Idle) (variant Running) (variant Stopped))",
+    );
+}
+
+test "enum mixing field and zero-field variants" {
+    try expectDecl(
+        "enum Option<T> { Some { value: T }, None }",
+        "(enum Option (generics T) (variant Some (field value T)) (variant None))",
+    );
+}
+
+test "enum with ASI-separated variants" {
+    try expectDecl(
+        "enum State {\n  Idle\n  Running\n  Stopped\n}",
+        "(enum State (variant Idle) (variant Running) (variant Stopped))",
+    );
+}
+
+// ----- type aliases -----
+
+test "simple type alias" {
+    try expectDecl("type IntList = Array<int>", "(typedef IntList Array<int>)");
+}
+
+test "generic type alias" {
+    try expectDecl(
+        "type Mapper<T, U> = fn(T) -> U",
+        "(typedef Mapper (generics T U) fn(T) -> U)",
+    );
+}
+
+test "type alias for optional error type" {
+    try expectDecl(
+        "type MaybeInt = !int?",
+        "(typedef MaybeInt !int?)",
+    );
+}
+
+// ----- top-level const -----
+
+test "top-level const without type annotation" {
+    try expectDecl("const PI = 3.14", "(const PI (float 3.14))");
+}
+
+test "top-level const with type annotation" {
+    try expectDecl(
+        "const MAX: int = 100",
+        "(const MAX : int (int 100))",
+    );
+}
+
+test "top-level const with complex expression" {
+    try expectDecl(
+        "const GREETING = \"hello, ${name}\"",
+        "(const GREETING (interp (text \"hello, \") (id name) (text \"\")))",
+    );
+}
+
+test "exported top-level const" {
+    try expectDecl(
+        "export const VERSION = \"1.0\"",
+        "(export (const VERSION (str \"1.0\")))",
+    );
+}
+
+// ----- whole-file parsing -----
+
+test "file with a single declaration" {
+    try expectFile(
+        "fn main() { }",
+        "(file (fn main (block)))",
+    );
+}
+
+test "file with multiple declarations separated by newlines" {
+    const src: [:0]const u8 =
+        \\const PI = 3.14
+        \\
+        \\record Circle { radius: float }
+        \\
+        \\fn area(c: Circle) -> float {
+        \\  PI * c.radius * c.radius
+        \\}
+    ;
+    try expectFile(
+        src,
+        "(file (const PI (float 3.14)) (record Circle (field radius float)) (fn area (c: Circle) -> float (block => (* (* (id PI) (. (id c) radius)) (. (id c) radius)))))",
+    );
+}
+
+test "file with exports" {
+    const src: [:0]const u8 =
+        \\export record Point { x: float, y: float }
+        \\export fn origin() -> Point { Point { x: 0.0, y: 0.0 } }
+    ;
+    try expectFile(
+        src,
+        "(file (export (record Point (field x float) (field y float))) (export (fn origin -> Point (block => (rec Point (f x (float 0.0)) (f y (float 0.0)))))))",
+    );
+}
+
+test "empty file parses cleanly" {
+    try expectFile("", "(file)");
+}
+
+test "file with only blank lines and comments" {
+    const src: [:0]const u8 =
+        \\// leading comment
+        \\
+        \\/* also nothing */
+        \\
+    ;
+    try expectFile(src, "(file)");
+}
+
+test "file recovers past a broken declaration" {
+    // The middle declaration is malformed (no `=` after the type alias
+    // name). The first and third declarations should still parse.
+    const src: [:0]const u8 =
+        \\const X = 1
+        \\type Broken
+        \\const Y = 2
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parser = try Parser.init(src, arena);
+    const file = try parser.parseFile();
+
+    try testing.expectEqual(@as(usize, 2), file.decls.len);
+    try testing.expect(parser.diagnostics.items.len >= 1);
+
+    const first = try ast.formatDeclAlloc(&file.decls[0], testing.allocator);
+    defer testing.allocator.free(first);
+    try testing.expectEqualStrings("(const X (int 1))", first);
+
+    const second = try ast.formatDeclAlloc(&file.decls[1], testing.allocator);
+    defer testing.allocator.free(second);
+    try testing.expectEqualStrings("(const Y (int 2))", second);
 }
 
 // ----- integration-ish parse of a representative program -----
